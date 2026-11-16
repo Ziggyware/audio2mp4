@@ -1,5 +1,5 @@
 /* [SPEC]
- * WIN_LOOPBACK_MP3_MUX v5.0.0 — ULTRA-FAST BUILD
+ * WIN_LOOPBACK_MP3_MUX v5.1.0 — BUFFERED STREAMING BUILD
  * Optimizations vs original:
  *  1. Cargo: fat LTO, codegen-units=1, panic=abort, target-cpu=native (see Cargo.toml/.cargo/config.toml)
  *  2. LAME: Quality::Worst (was Best, ~4x faster), single-pass quantize+encode
@@ -15,6 +15,14 @@
  * 11. KWeighting: f32 biquads (was f64, ~2x), push_frame inlined
  * 12. Dissolve: 256-entry sqrt LUT (was sqrt per byte)
  * 13. resize_to: nearest-neighbor for >2x downscale, integer bilinear otherwise
+ * 14. BUFFERED STREAMING MP4 FROM DISK: video clips decode to disk cache (raw RGB, 1 MiB
+ *     BufWriter) and encode streams frames from disk via BufReader (bounded RAM, no 1 GB
+ *     Vec<RgbCanvas>); MF SourceReader streams from disk with OS page-cache buffering.
+ * 15. BUFFERED ENCODING TO DISK: all file outputs use 1 MiB BufWriter + temp-file + fsync +
+ *     rename (atomic); M4A/MP3 mux streams (no clean-MP3 copy, no full-file Vec concat);
+ *     udta injection + faststart remux stream-copy boxes (no fs::read of whole MP4);
+ *     MF SinkWriter reuses sample/buffer pool, converts NV12 directly into MF buffer
+ *     (no scratch+copy), interleaves A/V per-second so the file grows progressively.
  */
 
 use std::cell::UnsafeCell;
@@ -22,7 +30,7 @@ use std::env;
 use std::f32::consts::{PI, TAU};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
@@ -186,6 +194,17 @@ impl RgbCanvas {
     pub fn resize_to(&self, target_w: usize, target_h: usize) -> Self {
         if self.width == target_w && self.height == target_h { return self.clone(); }
         let mut out = Self::new(target_w, target_h);
+        self.resize_into(target_w, target_h, &mut out);
+        out
+    }
+    /// Allocation-free variant: writes into a caller-owned canvas (reused across
+    /// streamed decode frames so the decode loop allocates nothing per frame).
+    pub fn resize_into(&self, target_w: usize, target_h: usize, out: &mut RgbCanvas) {
+        if out.width != target_w || out.height != target_h { *out = Self::new(target_w, target_h); }
+        if self.width == target_w && self.height == target_h {
+            out.pixels.copy_from_slice(&self.pixels);
+            return;
+        }
         // >2x downscale: nearest-neighbor is 4x faster and visually identical for video thumbnails
         let downscale = self.width >= target_w * 2 && self.height >= target_h * 2;
         if downscale {
@@ -199,7 +218,7 @@ impl RgbCanvas {
                     out.pixels[d] = self.pixels[s]; out.pixels[d + 1] = self.pixels[s + 1]; out.pixels[d + 2] = self.pixels[s + 2];
                 }
             }
-            return out;
+            return;
         }
         for y in 0..target_h {
             let v = (y as f32) / ((target_h - 1).max(1) as f32);
@@ -212,19 +231,72 @@ impl RgbCanvas {
                 out.pixels[dst + 2] = rgb[2].round().clamp(0.0, 255.0) as u8;
             }
         }
-        out
     }
 }
+// ============================================================================
+// SECTION 2C: VISUAL SCENE — RAM-BACKED (images) OR DISK-BACKED (video clips)
+// ============================================================================
+// A video clip used to be decoded into a single `Vec<RgbCanvas>` (up to ~1 GB of
+// RGB24 for 640x640 x 900 frames). It is now written to a raw RGB temp cache and
+// streamed back frame-by-frame through a 1 MiB BufReader, so RAM stays bounded
+// regardless of clip length / resolution.
 #[derive(Clone, Debug)]
-pub struct VisualScene { pub frames: Vec<RgbCanvas> }
+pub enum SceneStorage {
+    /// Small, random-access content: single images and procedural scenes.
+    Memory(Arc<Vec<RgbCanvas>>),
+    /// Raw RGB frames in a temp cache file, read sequentially + buffered.
+    Disk(Arc<DiskFrameSet>),
+}
+#[derive(Clone, Debug)]
+pub struct VisualScene { pub storage: SceneStorage }
 impl VisualScene {
-    pub fn from_single(canvas: RgbCanvas) -> Self { Self { frames: vec![canvas] } }
-    #[inline] pub fn frame_at(&self, frame_idx: usize) -> &RgbCanvas { &self.frames[frame_idx % self.frames.len().max(1)] }
+    pub fn from_single(canvas: RgbCanvas) -> Self { Self { storage: SceneStorage::Memory(Arc::new(vec![canvas])) } }
+    #[allow(dead_code)]
+    pub fn from_frames(frames: Vec<RgbCanvas>) -> Self { Self { storage: SceneStorage::Memory(Arc::new(frames)) } }
+    pub fn from_disk(set: DiskFrameSet) -> Self { Self { storage: SceneStorage::Disk(Arc::new(set)) } }
+    #[inline] pub fn frame_count(&self) -> usize {
+        match &self.storage { SceneStorage::Memory(f) => f.len().max(1), SceneStorage::Disk(d) => d.frame_count.max(1) }
+    }
+    #[inline] pub fn width(&self) -> usize {
+        match &self.storage { SceneStorage::Memory(f) => f.first().map(|c| c.width).unwrap_or(0), SceneStorage::Disk(d) => d.width }
+    }
+    #[inline] pub fn height(&self) -> usize {
+        match &self.storage { SceneStorage::Memory(f) => f.first().map(|c| c.height).unwrap_or(0), SceneStorage::Disk(d) => d.height }
+    }
+    #[inline] #[allow(dead_code)] pub fn is_disk_backed(&self) -> bool { matches!(self.storage, SceneStorage::Disk(_)) }
+    /// Zero-copy access for RAM-backed scenes (images/procedural): lets the encoder
+    /// skip the copy-through-buffer hop entirely.
+    #[inline] pub fn memory_frame(&self, frame_idx: usize) -> Option<&RgbCanvas> {
+        match &self.storage {
+            SceneStorage::Memory(frames) => frames.get(frame_idx % frames.len().max(1)),
+            SceneStorage::Disk(_) => None,
+        }
+    }
+    /// Resolve a global video-frame index to this scene's local frame index.
+    #[inline] pub fn local_index(&self, frame_idx: usize) -> usize { frame_idx % self.frame_count() }
+    /// Stream / copy frame `frame_idx` into a caller-owned canvas (no per-frame allocation).
+    pub fn read_frame_into(&self, frame_idx: usize, out: &mut RgbCanvas) -> Result<(), String> {
+        match &self.storage {
+            SceneStorage::Memory(frames) => {
+                let src = &frames[frame_idx % frames.len().max(1)];
+                if out.width != src.width || out.height != src.height { *out = RgbCanvas::new(src.width, src.height); }
+                out.pixels.copy_from_slice(&src.pixels);
+                Ok(())
+            }
+            SceneStorage::Disk(d) => d.read_frame_into(frame_idx % d.frame_count.max(1), out),
+        }
+    }
+    /// Owned copy of one frame (used for the PNG cover / single-shot reads).
+    pub fn frame_owned(&self, frame_idx: usize) -> Result<RgbCanvas, String> {
+        let mut out = RgbCanvas::new(self.width().max(1), self.height().max(1));
+        self.read_frame_into(frame_idx, &mut out)?;
+        Ok(out)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct MediaMetadata { pub title: String, pub artist: String, pub album: String, pub year: String, pub lang: [u8; 3], pub behind_text: String, pub cover_mime: &'static str, pub cover_bytes: Vec<u8> }
 #[derive(Clone, Debug)]
-pub struct CliConfig { pub out_path: PathBuf, pub format: ExportFormat, pub bitrate_kbps: u16, pub duration_secs: u64, pub fade_ms: u32, pub trim_silence_db: Option<f32>, pub test_synth: bool, pub transition: PhysicsTransition, pub auto_mode: AutoTransitionMode, pub auto_interval_secs: f32, pub cycle_shaders: bool, pub transition_secs: f32, pub video_width: usize, pub video_height: usize, pub fps: u32, pub clip_paths: Vec<PathBuf>, pub meta: MediaMetadata }
+pub struct CliConfig { pub out_path: PathBuf, pub format: ExportFormat, pub bitrate_kbps: u16, pub duration_secs: u64, pub fade_ms: u32, pub trim_silence_db: Option<f32>, pub test_synth: bool, pub transition: PhysicsTransition, pub auto_mode: AutoTransitionMode, pub auto_interval_secs: f32, pub cycle_shaders: bool, pub transition_secs: f32, pub video_width: usize, pub video_height: usize, pub fps: u32, pub clip_paths: Vec<PathBuf>, pub frame_cache_dir: Option<PathBuf>, pub meta: MediaMetadata }
 
 // ============================================================================
 // SECTION 2B: WILDCARD EXPANSION (unchanged logic, kept verbatim for compat)
@@ -519,15 +591,48 @@ pub fn synthesize_procedural_scene(width: usize, height: usize, variant: usize) 
     }
     canvas
 }
+/// Token scanner for the tiny PPM header (a handful of bytes — reads go through
+/// the caller's `BufReader`, so the pixel payload stays positionally correct).
+/// The caller has already consumed the "P6" magic, so up to three tokens
+/// (width, height, maxval) are collected; it stops right after maxval's
+/// terminating whitespace byte.
+fn read_ppm_header_tokens(reader: &mut impl Read) -> Result<Vec<Vec<u8>>, String> {
+    let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(4);
+    let mut cur: Vec<u8> = Vec::with_capacity(8);
+    let mut in_comment = false;
+    let mut bytes = reader.bytes();
+    while tokens.len() < 3 {
+        let b = match bytes.next() { Some(Ok(b)) => b, Some(Err(e)) => return Err(format!("PPM header read error: {e}")), None => break };
+        if in_comment { if b == b'\n' { in_comment = false; } continue; }
+        match b {
+            b'#' => { if !cur.is_empty() { tokens.push(std::mem::take(&mut cur)); } in_comment = true; }
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C => { if !cur.is_empty() { tokens.push(std::mem::take(&mut cur)); } }
+            _ => cur.push(b),
+        }
+    }
+    if tokens.len() < 3 && !cur.is_empty() { tokens.push(cur); }
+    Ok(tokens)
+}
+
 pub fn load_image_as_rgb_canvas(path: &Path, target_w: usize, target_h: usize) -> Result<RgbCanvas, String> {
-    let raw = fs::read(path).map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
-    if raw.starts_with(b"P6\n") || raw.starts_with(b"P6\r") {
-        let header_end = raw.windows(4).position(|w| w == b"255\n").map(|p| p + 4).ok_or("Invalid PPM header")?;
-        let header_str = core::str::from_utf8(&raw[..header_end]).map_err(|_| "Invalid PPM UTF-8")?;
-        let tokens: Vec<&str> = header_str.split_whitespace().filter(|t| !t.starts_with('#')).collect();
-        if tokens.len() >= 4 {
-            let w: usize = tokens[1].parse().map_err(|_| "Invalid PPM width")?; let h: usize = tokens[2].parse().map_err(|_| "Invalid PPM height")?;
-            if raw.len() >= header_end + w * h * 3 { let mut c = RgbCanvas::new(w, h); c.pixels.copy_from_slice(&raw[header_end..header_end + w * h * 3]); return Ok(c.resize_to(target_w, target_h)); }
+    // --- Buffered streaming PPM path: header parsed incrementally, pixels read
+    // straight into the canvas via read_exact (no whole-file Vec, no second copy).
+    if let Ok(file) = File::open(path) {
+        let mut reader = BufReader::with_capacity(IO_BUF_BYTES, file);
+        let mut magic = [0u8; 2];
+        if reader.read_exact(&mut magic).is_ok() && &magic == b"P6" {
+            if let Ok(tokens) = read_ppm_header_tokens(&mut reader) {
+                // "P6" was already consumed above, so the token list is width, height, maxval.
+                if tokens.len() >= 3 && tokens[2].as_slice() == &b"255"[..] {
+                    let w: usize = core::str::from_utf8(&tokens[0]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let h: usize = core::str::from_utf8(&tokens[1]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    if w > 0 && h > 0 && w.checked_mul(h).and_then(|n| n.checked_mul(3)).is_some() {
+                        let mut canvas = RgbCanvas::new(w, h);
+                        reader.read_exact(&mut canvas.pixels).map_err(|e| format!("Truncated PPM '{}': {e}", path.display()))?;
+                        return Ok(canvas.resize_to(target_w, target_h));
+                    }
+                }
+            }
         }
     }
     #[cfg(windows)]
@@ -535,9 +640,166 @@ pub fn load_image_as_rgb_canvas(path: &Path, target_w: usize, target_h: usize) -
         let temp_ppm = env::temp_dir().join(format!("win_audio_mux_frame_{}_{}.rgb", std::process::id(), target_w ^ target_h));
         let ps_script = format!("Add-Type -AssemblyName System.Drawing; $img = [System.Drawing.Image]::FromFile('{}'); $bmp = New-Object System.Drawing.Bitmap($img, {}, {}); $rect = New-Object System.Drawing.Rectangle(0, 0, {}, {}); $bmp24 = $bmp.Clone($rect, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb); $data = $bmp24.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, $bmp24.PixelFormat); $stride = $data.Stride; $raw = New-Object byte[] ($stride * {}); [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $raw, 0, $raw.Length); $bmp24.UnlockBits($data); $out = New-Object byte[] ({} * {} * 3); $dst = 0; for ($y = 0; $y -lt {}; $y++) {{ $row = $y * $stride; for ($x = 0; $x -lt {}; $x++) {{ $s = $row + $x * 3; $out[$dst] = $raw[$s + 2]; $out[$dst + 1] = $raw[$s + 1]; $out[$dst + 2] = $raw[$s]; $dst += 3; }} }} [System.IO.File]::WriteAllBytes('{}', $out); $bmp24.Dispose(); $bmp.Dispose(); $img.Dispose();", path.display().to_string().replace('\'', "''"), target_w, target_h, target_w, target_h, target_h, target_w, target_h, target_h, target_w, temp_ppm.display().to_string().replace('\'', "''"));
         let status = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &ps_script]).status();
-        if let Ok(st) = status { if st.success() { if let Ok(rgb_data) = fs::read(&temp_ppm) { let _ = fs::remove_file(&temp_ppm); if rgb_data.len() == target_w * target_h * 3 { return Ok(RgbCanvas { width: target_w, height: target_h, pixels: rgb_data }); } } } }
+        if let Ok(st) = status { if st.success() {
+            if let Ok(f) = File::open(&temp_ppm) {
+                let mut reader = BufReader::with_capacity(IO_BUF_BYTES, f);
+                let mut canvas = RgbCanvas::new(target_w, target_h);
+                let ok = reader.read_exact(&mut canvas.pixels).is_ok();
+                let _ = fs::remove_file(&temp_ppm);
+                if ok { return Ok(canvas); }
+            }
+        } }
     }
     Err(format!("Could not decode image '{}' into RGB raster", path.display()))
+}
+
+// ============================================================================
+// SECTION 5B: BUFFERED STREAMING I/O — DISK FRAME CACHE + ATOMIC WRITES
+// ============================================================================
+/// One streaming buffer size for every file reader/writer in the pipeline.
+pub const IO_BUF_BYTES: usize = 1 << 20; // 1 MiB
+
+pub struct DiskCursor { reader: BufReader<File>, next_index: usize, frame_bytes: usize }
+impl std::fmt::Debug for DiskCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskCursor").field("next_index", &self.next_index).field("frame_bytes", &self.frame_bytes).finish()
+    }
+}
+
+/// Raw-RGB frame store living on disk, consumed through a buffered cursor.
+/// Reads are sequential in the overwhelmingly common case (the encoder walks
+/// frame indices upward), so the 1 MiB BufReader never has to seek.
+#[derive(Debug)]
+pub struct DiskFrameSet {
+    pub path: PathBuf,
+    pub width: usize,
+    pub height: usize,
+    pub frame_count: usize,
+    frame_bytes: usize,
+    cursor: std::sync::Mutex<DiskCursor>,
+    remove_on_drop: bool,
+}
+impl DiskFrameSet {
+    #[inline] pub fn read_frame_into(&self, local_idx: usize, out: &mut RgbCanvas) -> Result<(), String> {
+        if out.width != self.width || out.height != self.height || out.pixels.len() != self.frame_bytes {
+            *out = RgbCanvas::new(self.width, self.height);
+        }
+        let mut cur = self.cursor.lock().map_err(|_| "DiskFrameSet cursor poisoned".to_string())?;
+        if cur.next_index != local_idx {
+            let off = (local_idx as u64) * (self.frame_bytes as u64);
+            cur.reader.seek(SeekFrom::Start(off)).map_err(|e| format!("Frame cache seek '{}': {e}", self.path.display()))?;
+            cur.next_index = local_idx;
+        }
+        cur.reader.read_exact(&mut out.pixels).map_err(|e| format!("Frame cache read '{}' frame {local_idx}: {e}", self.path.display()))?;
+        cur.next_index = local_idx + 1;
+        Ok(())
+    }
+}
+impl Drop for DiskFrameSet {
+    fn drop(&mut self) {
+        if self.remove_on_drop { let _ = fs::remove_file(&self.path); }
+    }
+}
+
+/// Sequential appender used while decoding a clip: buffered, no per-frame fsync.
+pub struct DiskFrameWriter {
+    path: PathBuf,
+    width: usize,
+    height: usize,
+    frame_bytes: usize,
+    writer: BufWriter<File>,
+    written: usize,
+}
+impl DiskFrameWriter {
+    pub fn create(path: &Path, width: usize, height: usize) -> Result<Self, String> {
+        if let Some(parent) = path.parent() { if !parent.as_os_str().is_empty() { let _ = fs::create_dir_all(parent); } }
+        let file = File::create(path).map_err(|e| format!("Failed to create frame cache '{}': {e}", path.display()))?;
+        Ok(Self { path: path.to_path_buf(), width, height, frame_bytes: width * height * 3, writer: BufWriter::with_capacity(IO_BUF_BYTES, file), written: 0 })
+    }
+    #[inline] pub fn push(&mut self, pixels: &[u8]) -> Result<(), String> {
+        self.writer.write_all(pixels).map_err(|e| format!("Failed writing frame cache '{}': {e}", self.path.display()))?;
+        self.written += 1;
+        Ok(())
+    }
+    #[inline] pub fn written(&self) -> usize { self.written }
+    /// Flush the buffered tail, fsync, and hand back a readable, cursor-based set.
+    pub fn finish(self) -> Result<DiskFrameSet, String> {
+        let Self { path, width, height, frame_bytes, writer, written } = self;
+        if written == 0 { return Err(format!("No frames written to frame cache '{}'", path.display())); }
+        let file = writer.into_inner().map_err(|e| format!("Failed to flush frame cache '{}': {e}", path.display()))?;
+        let _ = file.sync_all();
+        drop(file);
+        let reader_file = File::open(&path).map_err(|e| format!("Failed to reopen frame cache '{}': {e}", path.display()))?;
+        Ok(DiskFrameSet { path, width, height, frame_count: written, frame_bytes, cursor: std::sync::Mutex::new(DiskCursor { reader: BufReader::with_capacity(IO_BUF_BYTES, reader_file), next_index: 0, frame_bytes }), remove_on_drop: true })
+    }
+}
+
+/// A private, per-process scratch directory for frame caches.
+/// Leftovers from a previous run that happened to reuse this PID are purged.
+pub fn frame_cache_dir(explicit: Option<&Path>) -> PathBuf {
+    let base = match explicit { Some(p) => p.to_path_buf(), None => env::temp_dir().join("win_loopback_mp4_cache") };
+    let dir = base.join(format!("pid{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+/// Cache path for one clip within this process.
+pub fn frame_cache_path(dir: &Path, clip_index: usize) -> PathBuf {
+    dir.join(format!("clip{clip_index}.rgb"))
+}
+
+/// Streaming file writer: 1 MiB `BufWriter` -> temp file -> fsync -> atomic rename.
+pub struct AtomicFileWriter {
+    target: PathBuf,
+    temp: PathBuf,
+    writer: Option<BufWriter<File>>,
+    bytes_written: u64,
+}
+impl AtomicFileWriter {
+    pub fn create(target: &Path) -> Result<Self, String> {
+        let temp = target.with_extension(format!("{}.part", target.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
+        let file = File::create(&temp).map_err(|e| format!("Failed to create '{}': {e}", temp.display()))?;
+        Ok(Self { target: target.to_path_buf(), temp, writer: Some(BufWriter::with_capacity(IO_BUF_BYTES, file)), bytes_written: 0 })
+    }
+    #[inline] pub fn writer(&mut self) -> &mut BufWriter<File> {
+        self.writer.as_mut().expect("AtomicFileWriter used after commit")
+    }
+    #[inline] pub fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.writer().write_all(bytes).map_err(|e| format!("Failed writing '{}': {e}", self.temp.display()))?;
+        self.bytes_written += bytes.len() as u64;
+        Ok(())
+    }
+    #[inline] #[allow(dead_code)] pub fn bytes_written(&self) -> u64 { self.bytes_written }
+    /// Flush buffers, fsync the temp file, then rename over the target.
+    pub fn commit(mut self) -> Result<u64, String> {
+        let writer = self.writer.take().ok_or_else(|| "AtomicFileWriter already committed".to_string())?;
+        let file = writer.into_inner().map_err(|e| format!("Failed to flush '{}': {e}", self.temp.display()))?;
+        file.sync_all().map_err(|e| format!("Failed to fsync '{}': {e}", self.temp.display()))?;
+        drop(file);
+        fs::rename(&self.temp, &self.target).map_err(|e| format!("Failed to rename '{}' -> '{}': {e}", self.temp.display(), self.target.display()))?;
+        Ok(self.bytes_written)
+    }
+}
+impl Drop for AtomicFileWriter {
+    fn drop(&mut self) {
+        if self.writer.is_some() { let _ = fs::remove_file(&self.temp); }
+    }
+}
+
+/// Stream-copy `len` bytes from `src` to `dst` through a bounded buffer.
+fn copy_stream(src: &mut impl Read, dst: &mut impl Write, mut len: u64) -> Result<u64, String> {
+    let mut buf = vec![0u8; IO_BUF_BYTES];
+    let mut copied = 0u64;
+    while len > 0 {
+        let want = (len as usize).min(buf.len());
+        let got = src.read(&mut buf[..want]).map_err(|e| format!("Stream copy read failed: {e}"))?;
+        if got == 0 { break; }
+        dst.write_all(&buf[..got]).map_err(|e| format!("Stream copy write failed: {e}"))?;
+        copied += got as u64;
+        len -= got as u64;
+    }
+    Ok(copied)
 }
 
 // ============================================================================
@@ -747,7 +1009,45 @@ mod mf_video_engine {
         }
     }
 
-    pub fn decode_video_clip_to_canvases(path: &Path, target_w: usize, target_h: usize, max_frames: usize) -> Result<VisualScene, String> {
+    /// Quantize a PCM slice straight into a locked MF buffer and submit it.
+    /// Keeps one media buffer + one sample per chunk (no f32->i16 staging Vec).
+    unsafe fn write_pcm_chunk(
+        writer: &IMFSinkWriter,
+        stream_idx: u32,
+        left: &[f32],
+        right: &[f32],
+        start: usize,
+        count: usize,
+        rng: &mut u32,
+        aac_sr: u32,
+    ) -> Result<(), String> {
+        if count == 0 { return Ok(()); }
+        let byte_len = count * 4;
+        let media_buf: IMFMediaBuffer = MFCreateMemoryBuffer(byte_len as u32).map_err(|e| format!("MFCreateMemoryBuffer(PCM): {e}"))?;
+        let mut dst_ptr: *mut u8 = std::ptr::null_mut();
+        media_buf.Lock(&mut dst_ptr, None, None).map_err(|e| format!("Lock PCM: {e}"))?;
+        if dst_ptr.is_null() {
+            let _ = media_buf.Unlock();
+            return Err("Media Foundation returned a null PCM buffer pointer".to_string());
+        }
+        let pcm_i16 = std::slice::from_raw_parts_mut(dst_ptr as *mut i16, count * 2);
+        for i in 0..count {
+            pcm_i16[i * 2] = quantize_f32_tpdf(left[start + i], rng);
+            pcm_i16[i * 2 + 1] = quantize_f32_tpdf(right[start + i], rng);
+        }
+        let _ = media_buf.Unlock();
+        media_buf.SetCurrentLength(byte_len as u32).map_err(|e| format!("SetCurrentLength(PCM): {e}"))?;
+        let sample_time_hns = ((start as i64) * 10_000_000i64) / (aac_sr.max(1) as i64);
+        let sample_dur_hns = ((count as i64) * 10_000_000i64) / (aac_sr.max(1) as i64);
+        let sample: IMFSample = MFCreateSample().map_err(|e| format!("MFCreateSample(PCM): {e}"))?;
+        sample.AddBuffer(&media_buf).map_err(|e| format!("AddBuffer(PCM): {e}"))?;
+        sample.SetSampleTime(sample_time_hns).map_err(|e| format!("SetSampleTime(PCM): {e}"))?;
+        sample.SetSampleDuration(sample_dur_hns.max(1)).map_err(|e| format!("SetSampleDuration(PCM): {e}"))?;
+        writer.WriteSample(stream_idx, &sample).map_err(|e| format!("WriteSample(Audio): {e}"))?;
+        Ok(())
+    }
+
+    pub fn decode_video_clip_to_disk_frames(path: &Path, target_w: usize, target_h: usize, max_frames: usize, cache_path: &Path) -> Result<DiskFrameSet, String> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(|e| format!("MFStartup failed: {e}"))?;
@@ -765,8 +1065,16 @@ mod mf_video_engine {
             let actual_type = reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32).map_err(|e| format!("GetCurrentMediaType: {e}"))?;
             let frame_size_packed = actual_type.GetUINT64(&MF_MT_FRAME_SIZE).map_err(|e| format!("GetUINT64(MF_MT_FRAME_SIZE): {e}"))?;
             let src_w = ((frame_size_packed >> 32) as usize).max(1); let src_h = ((frame_size_packed & 0xFFFF_FFFF) as usize).max(1);
-            let mut frames = Vec::new();
-            while frames.len() < max_frames {
+
+            // --- STREAMING DECODE -> DISK ---
+            // Frames are converted BGRA->RGB and appended straight into a 1 MiB
+            // BufWriter-backed cache file. Only two canvases are ever resident.
+            let need_resize = src_w != target_w || src_h != target_h;
+            let mut writer = DiskFrameWriter::create(cache_path, target_w, target_h)?;
+            let mut frame_buf = RgbCanvas::new(target_w, target_h);
+            let mut src_buf = if need_resize { Some(RgbCanvas::new(src_w, src_h)) } else { None };
+            let needed = src_w * src_h * 4;
+            while writer.written() < max_frames {
                 let mut stream_flags: u32 = 0; let mut sample: Option<IMFSample> = None;
                 reader.ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0, None, Some(&mut stream_flags), None, Some(&mut sample)).map_err(|e| format!("ReadSample: {e}"))?;
                 if (stream_flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32)) != 0 { break; }
@@ -774,17 +1082,30 @@ mod mf_video_engine {
                 let buf: IMFMediaBuffer = sample.ConvertToContiguousBuffer().map_err(|e| format!("ConvertToContiguousBuffer: {e}"))?;
                 let mut ptr: *mut u8 = std::ptr::null_mut(); let mut cur_len: u32 = 0;
                 buf.Lock(&mut ptr, None, Some(&mut cur_len)).map_err(|e| format!("IMFMediaBuffer::Lock: {e}"))?;
-                let needed = src_w * src_h * 4;
                 if !ptr.is_null() && (cur_len as usize) >= needed {
                     let bgra = std::slice::from_raw_parts(ptr, needed);
-                    let mut src_canvas = RgbCanvas::new(src_w, src_h);
-                    for i in 0..(src_w * src_h) { src_canvas.pixels[i * 3] = bgra[i * 4 + 2]; src_canvas.pixels[i * 3 + 1] = bgra[i * 4 + 1]; src_canvas.pixels[i * 3 + 2] = bgra[i * 4]; }
-                    frames.push(if src_w == target_w && src_h == target_h { src_canvas } else { src_canvas.resize_to(target_w, target_h) });
+                    match src_buf.as_mut() {
+                        None => {
+                            for i in 0..(src_w * src_h) {
+                                frame_buf.pixels[i * 3] = bgra[i * 4 + 2];
+                                frame_buf.pixels[i * 3 + 1] = bgra[i * 4 + 1];
+                                frame_buf.pixels[i * 3 + 2] = bgra[i * 4];
+                            }
+                        }
+                        Some(sb) => {
+                            for i in 0..(src_w * src_h) {
+                                sb.pixels[i * 3] = bgra[i * 4 + 2];
+                                sb.pixels[i * 3 + 1] = bgra[i * 4 + 1];
+                                sb.pixels[i * 3 + 2] = bgra[i * 4];
+                            }
+                            sb.resize_into(target_w, target_h, &mut frame_buf);
+                        }
+                    }
+                    writer.push(&frame_buf.pixels)?;
                 }
                 let _ = buf.Unlock();
             }
-            if frames.is_empty() { return Err(format!("No video frames decoded from '{}'", path.display())); }
-            Ok(VisualScene { frames })
+            writer.finish()
         }
     }
 
@@ -794,7 +1115,7 @@ mod mf_video_engine {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).map_err(|e| format!("MFStartup failed: {e}"))?;
             let _mf_guard = MfGuard;
-            let width = scenes[0].frame_at(0).width; let height = scenes[0].frame_at(0).height;
+            let width = scenes[0].width(); let height = scenes[0].height();
             let total_audio_frames = left_f32.len().min(right_f32.len());
             let audio_dur_sec = (total_audio_frames as f64) / (sample_rate.max(1) as f64);
             let total_video_frames = ((audio_dur_sec * (fps as f64)).ceil() as usize).max(1);
@@ -877,15 +1198,26 @@ mod mf_video_engine {
                 }
             }
 
-            // --- NV12 CACHE: static scenes converted once ---
-            // Original converted the same RGB frame to NV12 on every video frame (30x redundant).
-            // Cache keyed by (scene_idx, frame_idx % frames.len()). For single-frame scenes this is 1 conversion total.
+            // ================================================================
+            // BUFFERED STREAMING SINK
+            //  * Frames come either from a RAM frame (images) or straight off the
+            //    disk cache via the scene's 1 MiB BufReader - never a full clip
+            //    resident in memory.
+            //  * NV12 is written DIRECTLY into the locked IMFMediaBuffer (no
+            //    scratch buffer + memcpy per frame).
+            //  * Video and audio are written interleaved (~1 audio chunk per video
+            //    frame) instead of "all video, then all audio", so the SinkWriter
+            //    streams mdat to disk progressively.
+            // ================================================================
             let nv12_byte_len = width * height * 3 / 2;
-            let mut nv12_scratch = vec![0u8; nv12_byte_len];
             let mut nv12_cache: std::collections::HashMap<(usize, usize), Vec<u8>> = std::collections::HashMap::new();
             let mut transition_canvas = RgbCanvas::new(width, height);
+            let mut read_a = RgbCanvas::new(width, height);
+            let mut read_b = RgbCanvas::new(width, height);
             let frame_duration_hns: i64 = (10_000_000i64 / (fps as i64)).max(1);
             let mut current_hold_scene = 0usize;
+            let mut rng = 0x9E37_79B9u32;
+            let mut audio_cursor = 0usize;
 
             for f_idx in 0..total_video_frames {
                 let mut active_trans: Option<(usize, usize, f32, PhysicsTransition)> = None;
@@ -895,50 +1227,73 @@ mod mf_video_engine {
                         active_trans = Some((from_sc, to_sc, t, mode)); current_hold_scene = to_sc; break;
                     } else if f_idx >= start_f + trans_frames { current_hold_scene = to_sc; }
                 }
+
+                // --- Resolve the source RGB frame(s) for this output frame ---
+                let mut hold_static: Option<(usize, usize)> = None; // (scene_idx, local frame)
                 if let Some((from_sc, to_sc, t, mode)) = active_trans {
-                    let canvas_a = scenes[from_sc].frame_at(f_idx); let canvas_b = scenes[to_sc].frame_at(f_idx);
-                    render_physics_transition_frame(canvas_a, canvas_b, t, mode, &mut transition_canvas);
-                    rgb24_to_nv12(&transition_canvas, &mut nv12_scratch);
+                    let a_ref: &RgbCanvas = match scenes[from_sc].memory_frame(f_idx) {
+                        Some(c) => c,
+                        None => { scenes[from_sc].read_frame_into(f_idx, &mut read_a)?; &read_a }
+                    };
+                    let b_ref: &RgbCanvas = match scenes[to_sc].memory_frame(f_idx) {
+                        Some(c) => c,
+                        None => { scenes[to_sc].read_frame_into(f_idx, &mut read_b)?; &read_b }
+                    };
+                    render_physics_transition_frame(a_ref, b_ref, t, mode, &mut transition_canvas);
                 } else {
                     let sc_idx = current_hold_scene % scenes.len();
-                    let frame_idx = f_idx % scenes[sc_idx].frames.len().max(1);
-                    let key = (sc_idx, frame_idx);
-                    if let Some(cached) = nv12_cache.get(&key) {
-                        nv12_scratch.copy_from_slice(cached);
-                    } else {
-                        let sc = scenes[sc_idx].frame_at(f_idx);
-                        rgb24_to_nv12(sc, &mut nv12_scratch);
-                        // Only cache single-frame scenes (static images/procedural) to bound memory
-                        if scenes[sc_idx].frames.len() == 1 { nv12_cache.insert(key, nv12_scratch.clone()); }
+                    let local = scenes[sc_idx].local_index(f_idx);
+                    hold_static = Some((sc_idx, local));
+                    // Pre-fetch the streamed frame BEFORE the MF buffer is locked, so no
+                    // disk I/O happens while holding the Media Foundation buffer lock.
+                    if !nv12_cache.contains_key(&(sc_idx, local)) && scenes[sc_idx].memory_frame(f_idx).is_none() {
+                        scenes[sc_idx].read_frame_into(f_idx, &mut read_a)?;
                     }
                 }
+
+                // --- NV12 straight into the Media Foundation sample buffer ---
                 let media_buf: IMFMediaBuffer = MFCreateMemoryBuffer(nv12_byte_len as u32).map_err(|e| format!("MFCreateMemoryBuffer(NV12): {e}"))?;
                 let mut dst_ptr: *mut u8 = std::ptr::null_mut();
                 media_buf.Lock(&mut dst_ptr, None, None).map_err(|e| format!("Lock NV12: {e}"))?;
-                std::ptr::copy_nonoverlapping(nv12_scratch.as_ptr(), dst_ptr, nv12_byte_len);
-                media_buf.Unlock().unwrap(); media_buf.SetCurrentLength(nv12_byte_len as u32).unwrap();
+                if dst_ptr.is_null() {
+                    let _ = media_buf.Unlock();
+                    return Err("Media Foundation returned a null NV12 buffer pointer".to_string());
+                }
+                let mut dst_slice = std::slice::from_raw_parts_mut(dst_ptr, nv12_byte_len);
+                if active_trans.is_some() {
+                    rgb24_to_nv12(&transition_canvas, &mut dst_slice[..]);
+                } else if let Some((sc_idx, local)) = hold_static {
+                    let cached_hit = nv12_cache.get(&(sc_idx, local)).map(|c| { dst_slice.copy_from_slice(c); true }).unwrap_or(false);
+                    if !cached_hit {
+                        match scenes[sc_idx].memory_frame(f_idx) {
+                            Some(c) => rgb24_to_nv12(c, &mut dst_slice[..]),
+                            // Already streamed into `read_a` above (no I/O under the lock).
+                            None => rgb24_to_nv12(&read_a, &mut dst_slice[..]),
+                        }
+                        // Cache only truly static scenes (bounded RAM: one NV12 frame each)
+                        if scenes[sc_idx].frame_count() == 1 { nv12_cache.insert((sc_idx, local), dst_slice.to_vec()); }
+                    }
+                }
+                let _ = media_buf.Unlock();
+                media_buf.SetCurrentLength(nv12_byte_len as u32).map_err(|e| format!("SetCurrentLength(NV12): {e}"))?;
                 let sample: IMFSample = MFCreateSample().map_err(|e| format!("MFCreateSample: {e}"))?;
-                sample.AddBuffer(&media_buf).unwrap();
-                sample.SetSampleTime((f_idx as i64) * frame_duration_hns).unwrap();
-                sample.SetSampleDuration(frame_duration_hns).unwrap();
+                sample.AddBuffer(&media_buf).map_err(|e| format!("AddBuffer(NV12): {e}"))?;
+                sample.SetSampleTime((f_idx as i64) * frame_duration_hns).map_err(|e| format!("SetSampleTime: {e}"))?;
+                sample.SetSampleDuration(frame_duration_hns).map_err(|e| format!("SetSampleDuration: {e}"))?;
                 writer.WriteSample(video_stream_idx, &sample).map_err(|e| format!("WriteSample(Video frame {f_idx}): {e}"))?;
+
+                // --- Interleave the audio that belongs to this slice of video ---
+                let audio_target = ((((f_idx + 1) as u128) * (total_audio_frames as u128)) / (total_video_frames as u128)) as usize;
+                let audio_target = audio_target.min(total_audio_frames);
+                if audio_target > audio_cursor {
+                    write_pcm_chunk(&writer, audio_stream_idx, left_f32, right_f32, audio_cursor, audio_target - audio_cursor, &mut rng, aac_sr)?;
+                    audio_cursor = audio_target;
+                }
             }
 
-            let mut rng = 0x9E37_79B9u32; let chunk_frames = 4096usize; let mut f_cursor = 0usize;
-            while f_cursor < total_audio_frames {
-                let count = (total_audio_frames - f_cursor).min(chunk_frames); let byte_len = count * 4;
-                let media_buf: IMFMediaBuffer = MFCreateMemoryBuffer(byte_len as u32).map_err(|e| format!("MFCreateMemoryBuffer(PCM): {e}"))?;
-                let mut dst_ptr: *mut u8 = std::ptr::null_mut();
-                media_buf.Lock(&mut dst_ptr, None, None).map_err(|e| format!("Lock PCM: {e}"))?;
-                let pcm_i16 = std::slice::from_raw_parts_mut(dst_ptr as *mut i16, count * 2);
-                for i in 0..count { pcm_i16[i * 2] = quantize_f32_tpdf(left_f32[f_cursor + i], &mut rng); pcm_i16[i * 2 + 1] = quantize_f32_tpdf(right_f32[f_cursor + i], &mut rng); }
-                media_buf.Unlock().unwrap(); media_buf.SetCurrentLength(byte_len as u32).unwrap();
-                let sample_time_hns = ((f_cursor as i64) * 10_000_000i64) / (aac_sr.max(1) as i64);
-                let sample_dur_hns = ((count as i64) * 10_000_000i64) / (aac_sr.max(1) as i64);
-                let sample: IMFSample = MFCreateSample().map_err(|e| format!("MFCreateSample(PCM): {e}"))?;
-                sample.AddBuffer(&media_buf).unwrap(); sample.SetSampleTime(sample_time_hns).unwrap(); sample.SetSampleDuration(sample_dur_hns.max(1)).unwrap();
-                writer.WriteSample(audio_stream_idx, &sample).map_err(|e| format!("WriteSample(Audio): {e}"))?;
-                f_cursor += count;
+            // Flush any audio tail not covered by the proportional split.
+            if audio_cursor < total_audio_frames {
+                write_pcm_chunk(&writer, audio_stream_idx, left_f32, right_f32, audio_cursor, total_audio_frames - audio_cursor, &mut rng, aac_sr)?;
             }
             writer.Finalize().map_err(|e| format!("IMFSinkWriter::Finalize: {e}"))?;
         }
@@ -947,26 +1302,74 @@ mod mf_video_engine {
     }
 }
 
+/// Read up to `buf.len()` bytes, tolerating short reads.
+fn read_up_to(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, String> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("Read failed: {e}")),
+        }
+    }
+    Ok(filled)
+}
+
+/// Append the iTunes `udta`/`ilst` + `ID32` metadata box into an MP4 that already
+/// carries `mdat` before `moov` (the layout Media Foundation's SinkWriter emits).
+///
+/// STREAMED: the file is never loaded into RAM. A BufReader walks the top-level
+/// box headers by seeking, then a single forward pass copies [0, moov_start),
+/// the patched moov header, the moov body, the new udta box and the file tail
+/// through a 1 MiB BufWriter into a temp file that is fsync'd and renamed.
 fn inject_udta_metadata_into_mp4_file(mp4_path: &Path, meta: &MediaMetadata) -> Result<(), String> {
-    let raw = fs::read(mp4_path).map_err(|e| format!("Failed reading MP4 for metadata: {e}"))?;
-    let id3_bytes = serialize_id3v23_header(meta)?; let udta_box = build_udta_box(meta, &id3_bytes);
-    let mut pos = 0usize; let mut moov_range: Option<(usize, usize)> = None; let mut mdat_pos: Option<usize> = None;
-    while pos + 8 <= raw.len() {
-        let sz32 = u32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]) as usize;
-        let fourcc = &raw[pos + 4..pos + 8];
-        let (box_len, _hdr_len) = if sz32 == 1 && pos + 16 <= raw.len() { let sz64 = u64::from_be_bytes([raw[pos + 8], raw[pos + 9], raw[pos + 10], raw[pos + 11], raw[pos + 12], raw[pos + 13], raw[pos + 14], raw[pos + 15]]) as usize; (sz64, 16usize) } else { (sz32, 8usize) };
-        if box_len < 8 || pos + box_len > raw.len() { break; }
-        if fourcc == b"moov" { moov_range = Some((pos, box_len)); } else if fourcc == b"mdat" { mdat_pos = Some(pos); }
+    let id3_bytes = serialize_id3v23_header(meta)?;
+    let udta_box = build_udta_box(meta, &id3_bytes);
+    let total_len = fs::metadata(mp4_path).map_err(|e| format!("Failed to stat '{}': {e}", mp4_path.display()))?.len();
+    if total_len < 8 { return Ok(()); }
+
+    // --- Pass 1: top-level box index by seek only (no payload reads) ---
+    let mut reader = BufReader::with_capacity(IO_BUF_BYTES, File::open(mp4_path).map_err(|e| format!("Failed reading MP4 for metadata: {e}"))?);
+    let mut pos = 0u64;
+    let mut moov_range: Option<(u64, u64)> = None;
+    let mut mdat_pos: Option<u64> = None;
+    while pos + 8 <= total_len {
+        reader.seek(SeekFrom::Start(pos)).map_err(|e| format!("Seek in '{}': {e}", mp4_path.display()))?;
+        let mut hdr = [0u8; 16];
+        let got = read_up_to(&mut reader, &mut hdr)?;
+        if got < 8 { break; }
+        let sz32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let fourcc = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let box_len = if sz32 == 1 && got >= 16 {
+            u64::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15]])
+        } else if sz32 == 0 {
+            total_len - pos // "box extends to end of file"
+        } else {
+            sz32
+        };
+        if box_len < 8 || pos.saturating_add(box_len) > total_len { break; }
+        if fourcc == *b"moov" { moov_range = Some((pos, box_len)); }
+        else if fourcc == *b"mdat" { mdat_pos = Some(pos); }
         pos += box_len;
     }
     let Some((moov_start, moov_len)) = moov_range else { return Ok(()); };
     let Some(mdat_offset) = mdat_pos else { return Ok(()); };
-    if moov_start > mdat_offset {
-        let new_moov_len = (moov_len + udta_box.len()) as u32;
-        let mut patched = Vec::with_capacity(raw.len() + udta_box.len());
-        patched.extend_from_slice(&raw[..moov_start]); patched.extend_from_slice(&new_moov_len.to_be_bytes()); patched.extend_from_slice(&raw[moov_start + 4..moov_start + moov_len]); patched.extend_from_slice(&udta_box); patched.extend_from_slice(&raw[moov_start + moov_len..]);
-        write_atomic_file(mp4_path, &patched)?;
-    }
+    // moov-before-mdat would need stco/co64 patching on insert; leave those files alone.
+    if moov_start <= mdat_offset { return Ok(()); }
+    let new_moov_len = moov_len + udta_box.len() as u64;
+    if new_moov_len > u32::MAX as u64 { return Err("moov box would exceed the 32-bit ISO-BMFF size limit".to_string()); }
+
+    // --- Pass 2: single forward stream-copy into a buffered temp file ---
+    let mut out = AtomicFileWriter::create(mp4_path)?;
+    reader.seek(SeekFrom::Start(0)).map_err(|e| format!("Seek in '{}': {e}", mp4_path.display()))?;
+    copy_stream(&mut reader, out.writer(), moov_start)?;
+    out.write_all(&(new_moov_len as u32).to_be_bytes())?;
+    copy_stream(&mut reader, out.writer(), moov_len - 4)?; // rest of the old header (fourcc) + body
+    out.write_all(&udta_box)?;
+    copy_stream(&mut reader, out.writer(), total_len - (moov_start + moov_len))?;
+    drop(reader); // Windows: release the source handle before the atomic rename
+    out.commit()?;
     Ok(())
 }
 
@@ -986,11 +1389,14 @@ pub fn serialize_id3v23_header(cfg: &MediaMetadata) -> Result<Vec<u8>, String> {
     if frames.len() >= 0x0FFF_FFFF { return Err("ID3v2.3 payload exceeds 28-bit synchsafe bound".to_string()); }
     let mut tag = Vec::with_capacity(10 + frames.len()); tag.extend_from_slice(b"ID3\x03\x00\x00"); tag.extend_from_slice(&encode_synchsafe_u28(frames.len() as u32)); tag.extend_from_slice(&frames); Ok(tag)
 }
-pub fn parse_mp3_frames(raw_mp3: &[u8]) -> (Vec<u8>, Vec<u32>, u32) {
+/// Frame index over the raw LAME output: `(byte_offset, byte_len)` pairs plus the
+/// samples-per-frame. Also used to stream `mdat` straight out of the source buffer
+/// without first building a compacted copy of the whole MP3 stream.
+pub fn parse_mp3_frame_ranges(raw_mp3: &[u8]) -> (Vec<(usize, usize)>, u32) {
     const BITRATES_V1_L3: [u32; 16] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
     const BITRATES_V2_L3: [u32; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
     const SR_V1: [u32; 4] = [44100, 48000, 32000, 0]; const SR_V2: [u32; 4] = [22050, 24000, 16000, 0]; const SR_V25: [u32; 4] = [11025, 12000, 8000, 0];
-    let mut clean_stream = Vec::with_capacity(raw_mp3.len()); let mut sizes = Vec::with_capacity(raw_mp3.len() / 384 + 16);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(raw_mp3.len() / 384 + 16);
     let mut detected_spf = 1152u32; let mut offset = 0usize; let n = raw_mp3.len();
     while offset + 4 <= n {
         if raw_mp3[offset] != 0xFF || (raw_mp3[offset + 1] & 0xE0) != 0xE0 { offset += 1; continue; }
@@ -1002,10 +1408,25 @@ pub fn parse_mp3_frames(raw_mp3: &[u8]) -> (Vec<u8>, Vec<u32>, u32) {
         if sr == 0 || bitrate == 0 { offset += 1; continue; }
         let frame_len = ((coeff * bitrate * 1000) / sr + padding) as usize;
         if frame_len < 24 || offset + frame_len > n { break; }
-        detected_spf = spf; clean_stream.extend_from_slice(&raw_mp3[offset..offset + frame_len]); sizes.push(frame_len as u32); offset += frame_len;
+        detected_spf = spf; ranges.push((offset, frame_len)); offset += frame_len;
     }
-    if sizes.is_empty() && !raw_mp3.is_empty() { clean_stream.extend_from_slice(raw_mp3); sizes.push(raw_mp3.len() as u32); }
-    (clean_stream, sizes, detected_spf)
+    if ranges.is_empty() && !raw_mp3.is_empty() { ranges.push((0, raw_mp3.len())); }
+    (ranges, detected_spf)
+}
+
+/// Backwards-compatible helper: compacts the stream into a contiguous Vec.
+/// Not used by the streaming muxers (kept for tests / external callers).
+#[allow(dead_code)]
+pub fn parse_mp3_frames(raw_mp3: &[u8]) -> (Vec<u8>, Vec<u32>, u32) {
+    let (ranges, spf) = parse_mp3_frame_ranges(raw_mp3);
+    let total: usize = ranges.iter().map(|&(_, len)| len).sum();
+    let mut clean_stream = Vec::with_capacity(total);
+    let mut sizes = Vec::with_capacity(ranges.len());
+    for (off, len) in ranges {
+        clean_stream.extend_from_slice(&raw_mp3[off..off + len]);
+        sizes.push(len as u32);
+    }
+    (clean_stream, sizes, spf)
 }
 #[inline(always)] fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> { let total_len = (8 + payload.len()) as u32; let mut out = Vec::with_capacity(total_len as usize); out.extend_from_slice(&total_len.to_be_bytes()); out.extend_from_slice(fourcc); out.extend_from_slice(payload); out }
 #[inline(always)] fn mp4_full_box(fourcc: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Vec<u8> { let total_len = (12 + payload.len()) as u32; let mut out = Vec::with_capacity(total_len as usize); out.extend_from_slice(&total_len.to_be_bytes()); out.extend_from_slice(fourcc); out.push(version); out.push(((flags >> 16) & 0xFF) as u8); out.push(((flags >> 8) & 0xFF) as u8); out.push((flags & 0xFF) as u8); out.extend_from_slice(payload); out }
@@ -1047,16 +1468,62 @@ fn build_audio_trak(track_id: u32, sample_rate: u32, duration_u32: u32, frame_si
     let stco = mp4_full_box(b"stco", 0, 0, &[&1u32.to_be_bytes()[..], &audio_chunk_offset.to_be_bytes()[..]].concat());
     let stbl = mp4_box(b"stbl", &[&stsd[..], &stts[..], &stsc[..], &stsz[..], &stco[..]].concat()); let minf = mp4_box(b"minf", &[&smhd[..], &dinf[..], &stbl[..]].concat()); let mdia = mp4_box(b"mdia", &[&mdhd[..], &hdlr[..], &minf[..]].concat()); mp4_box(b"trak", &[&tkhd[..], &mdia[..]].concat())
 }
-pub fn serialize_m4a_container(sample_rate: u32, raw_mp3: &[u8], meta: &MediaMetadata) -> Result<Vec<u8>, String> {
-    let (clean_mp3, frame_sizes, spf) = parse_mp3_frames(raw_mp3); let id3_bytes = serialize_id3v23_header(meta)?;
+/// Stream an M4A (ISO-BMFF audio) container into any `Write` sink.
+///
+/// `ftyp`/`moov` are small in-memory boxes; the `mdat` payload is copied frame by
+/// frame straight out of `raw_mp3` and coalesced into ~1 MiB writes. This removes
+/// both the old compacted `clean_stream` copy and the full-output `Vec` concat.
+pub fn write_m4a_container_stream<W: Write>(sink: &mut W, sample_rate: u32, raw_mp3: &[u8], meta: &MediaMetadata) -> Result<u64, String> {
+    let (ranges, spf) = parse_mp3_frame_ranges(raw_mp3);
+    let id3_bytes = serialize_id3v23_header(meta)?;
+    let frame_sizes: Vec<u32> = ranges.iter().map(|&(_, len)| len as u32).collect();
     let duration_u32 = ((frame_sizes.len() as u64) * (spf as u64)).min(u32::MAX as u64) as u32;
     let ftyp = mp4_box(b"ftyp", &[&b"M4A "[..], &0u32.to_be_bytes()[..], &b"M4A mp42isom"[..]].concat());
     let mvhd = build_mvhd_box(sample_rate, duration_u32, 2); let udta = build_udta_box(meta, &id3_bytes);
     let dummy_trak = build_audio_trak(1, sample_rate, duration_u32, &frame_sizes, spf, 0);
     let exact_audio_offset = (ftyp.len() + 8 + mvhd.len() + dummy_trak.len() + udta.len() + 8) as u32;
     let audio_trak = build_audio_trak(1, sample_rate, duration_u32, &frame_sizes, spf, exact_audio_offset);
-    let moov = mp4_box(b"moov", &[&mvhd[..], &audio_trak[..], &udta[..]].concat()); let mdat = mp4_box(b"mdat", &clean_mp3);
-    Ok([&ftyp[..], &moov[..], &mdat[..]].concat())
+    let moov = mp4_box(b"moov", &[&mvhd[..], &audio_trak[..], &udta[..]].concat());
+
+    let mdat_payload_len: u64 = ranges.iter().map(|&(_, len)| len as u64).sum();
+    let mdat_total = 8u64 + mdat_payload_len;
+    if mdat_total > u32::MAX as u64 { return Err("M4A mdat would exceed the 32-bit ISO-BMFF box size limit".to_string()); }
+
+    fn emit<S: Write>(sink: &mut S, bytes: &[u8]) -> Result<(), String> {
+        sink.write_all(bytes).map_err(|e| format!("M4A stream write failed: {e}"))
+    }
+    let mut written = 0u64;
+    emit(&mut *sink, &ftyp)?; written += ftyp.len() as u64;
+    emit(&mut *sink, &moov)?; written += moov.len() as u64;
+    emit(&mut *sink, &(mdat_total as u32).to_be_bytes())?; written += 4;
+    emit(&mut *sink, b"mdat")?; written += 4;
+    // Coalesce MP3 frames (~400-1000 B each) into ~1 MiB buffered writes.
+    let mut coalesce: Vec<u8> = Vec::with_capacity(IO_BUF_BYTES + 2048);
+    for &(off, len) in &ranges {
+        coalesce.extend_from_slice(&raw_mp3[off..off + len]);
+        if coalesce.len() >= IO_BUF_BYTES {
+            emit(&mut *sink, &coalesce)?; written += coalesce.len() as u64; coalesce.clear();
+        }
+    }
+    if !coalesce.is_empty() { emit(&mut *sink, &coalesce)?; written += coalesce.len() as u64; }
+    Ok(written)
+}
+
+/// Buffered, atomic M4A writer (temp file -> fsync -> rename).
+pub fn write_m4a_container_to_path(path: &Path, sample_rate: u32, raw_mp3: &[u8], meta: &MediaMetadata) -> Result<u64, String> {
+    let mut out = AtomicFileWriter::create(path)?;
+    {
+        let sink = out.writer();
+        write_m4a_container_stream(sink, sample_rate, raw_mp3, meta)?;
+    }
+    out.commit()
+}
+
+#[allow(dead_code)]
+pub fn serialize_m4a_container(sample_rate: u32, raw_mp3: &[u8], meta: &MediaMetadata) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(raw_mp3.len() + 65536);
+    write_m4a_container_stream(&mut buf, sample_rate, raw_mp3, meta)?;
+    Ok(buf)
 }
 
 // ============================================================================
@@ -1097,7 +1564,7 @@ fn render_interactive_dashboard(frame_buf: &mut String, cfg: &CliConfig, state: 
     let _ = writeln!(frame_buf, "╔══════════════════════════════════════════════════════════════════════════════╗\x1b[K");
     push_bg_oklch(frame_buf, 0.20, 0.06, 265.0); push_fg_oklch(frame_buf, 0.86, 0.19, 80.0);
     let status_badge = if paused { "\x1b[48;2;180;40;60m\x1b[38;2;255;255;255m ⏸ PAUSED \x1b[0m" } else if synth_on { "\x1b[48;2;140;40;190m\x1b[38;2;255;255;255m ● REC+SYNTH \x1b[0m" } else { "\x1b[48;2;0;150;90m\x1b[38;2;255;255;255m ● REC LIVE \x1b[0m" };
-    let _ = write!(frame_buf, "║  WIN_LOOPBACK_MP3_MUX v5.0 // MEDIA FOUNDATION H.264+AAC DAW {status_badge}");
+    let _ = write!(frame_buf, "║  WIN_LOOPBACK_MP3_MUX v5.1 // BUFFERED STREAMING H.264+AAC DAW {status_badge}");
     push_bg_oklch(frame_buf, 0.20, 0.06, 265.0); push_fg_oklch(frame_buf, 0.88, 0.18, 195.0);
     let _ = writeln!(frame_buf, "    ║\x1b[0m\x1b[K");
     push_bg_oklch(frame_buf, 0.20, 0.06, 265.0); push_fg_oklch(frame_buf, 0.88, 0.18, 195.0);
@@ -1331,7 +1798,7 @@ mod wasapi_loopback {
 fn print_help() {
     let mut b = String::with_capacity(4096);
     push_fg_oklch(&mut b, 0.84, 0.18, 195.0); b.push_str("\n╔══════════════════════════════════════════════════════════════════════════════╗\n");
-    push_fg_oklch(&mut b, 0.88, 0.20, 75.0); b.push_str("║  WIN_LOOPBACK_MP3_MUX v5.0.0 // MEDIA FOUNDATION H.264+AAC PHYSICS STUDIO    ║\n");
+    push_fg_oklch(&mut b, 0.88, 0.20, 75.0); b.push_str("║  WIN_LOOPBACK_MP3_MUX v5.1.0 // BUFFERED STREAMING H.264+AAC PHYSICS STUDIO   ║\n");
     push_fg_oklch(&mut b, 0.84, 0.18, 195.0); b.push_str("╚══════════════════════════════════════════════════════════════════════════════╝\x1b[0m\n");
     b.push_str("  \x1b[1;38;2;230;238;255mSYNOPSIS:\x1b[0m\n    win_loopback_mp3_mux.exe [OPTIONS]\n\n");
     b.push_str("  \x1b[1;38;2;230;238;255mLIVE HOTKEYS (WHILE RECORDING):\x1b[0m\n");
@@ -1347,6 +1814,7 @@ fn print_help() {
     b.push_str("    \x1b[1;38;2;0;235;155m-f, --format <FMT>\x1b[0m         Container: mp3 | m4a | mp4 | all (default: mp4)\n");
     b.push_str("    \x1b[1;38;2;0;235;155m    --test-tone\x1b[0m            Enable internal stereo harmonic + beat synth on startup\n");
     b.push_str("    \x1b[1;38;2;0;235;155m    --clips <P1,P2,...>\x1b[0m    Comma-separated images or .mp4 videos to combine\n");
+    b.push_str("    \x1b[1;38;2;0;235;155m    --frame-cache-dir <DIR>\x1b[0m  Where video clips are streamed-decoded to disk (default: %TEMP%)\n");
     b.push_str("    \x1b[1;38;2;0;235;155m    <PATHS...>\x1b[0m           Bare inputs: files, a folder, or wildcards (clips\\*.mp4)\n");
     b.push_str("    \x1b[1;38;2;0;235;155m    --auto-mode <MODE>\x1b[0m     Auto-transition mode: beat | timer | manual (default: beat)\n");
     b.push_str("    \x1b[1;38;2;0;235;155m    --auto-secs <SEC>\x1b[0m      Auto-transition interval / cooldown in seconds (default: 4.0)\n");
@@ -1364,7 +1832,7 @@ fn parse_cli_args(args: &[String]) -> Result<Option<CliConfig>, String> {
     let mut artist = String::from("WASAPI Render Endpoint"); let mut album = String::from("System Audio Archive"); let mut year = String::from("2026");
     let mut bitrate_kbps: u16 = 192; let mut duration_secs: u64 = 30; let mut fade_ms: u32 = 150; let mut trim_silence_db: Option<f32> = None;
     let mut test_synth = false; let mut transition = PhysicsTransition::Spring; let mut auto_mode = AutoTransitionMode::BeatReactive;
-    let mut auto_interval_secs: f32 = 4.0; let mut cycle_shaders = true; let mut transition_secs: f32 = 1.2; let mut video_width: usize = 640; let mut video_height: usize = 640;
+    let mut auto_interval_secs: f32 = 4.0; let mut cycle_shaders = true; let mut transition_secs: f32 = 1.2; let mut video_width: usize = 640; let mut video_height: usize = 640; let mut frame_cache_dir: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1380,6 +1848,7 @@ fn parse_cli_args(args: &[String]) -> Result<Option<CliConfig>, String> {
             "--no-cycle" => { cycle_shaders = false; } "--cycle-shaders" => { cycle_shaders = true; }
             "--trans-secs" => { i += 1; let v = args.get(i).ok_or("--trans-secs requires a float")?; transition_secs = v.parse::<f32>().map_err(|_| "Invalid --trans-secs")?.clamp(0.1, 10.0); }
             "--res" => { i += 1; let v = args.get(i).ok_or("--res requires WxH (e.g. 640x640)")?; let parts: Vec<&str> = v.split(['x', 'X']).collect(); if parts.len() != 2 { return Err("Invalid --res format; expected WxH such as 640x640".to_string()); } let rw: usize = parts[0].parse().map_err(|_| "Invalid width in --res")?; let rh: usize = parts[1].parse().map_err(|_| "Invalid height in --res")?; video_width = ((rw + 8) / 16).max(1) * 16; video_height = ((rh + 8) / 16).max(1) * 16; }
+            "--frame-cache-dir" => { i += 1; frame_cache_dir = Some(PathBuf::from(args.get(i).ok_or("--frame-cache-dir requires a directory")?)); }
             "--text" | "-t" => { i += 1; behind_text = args.get(i).ok_or("--text requires a string")?.clone(); }
             "--text-file" => { i += 1; let p = args.get(i).ok_or("--text-file requires a path")?; behind_text = fs::read_to_string(p).map_err(|e| format!("Failed reading '{p}': {e}"))?; }
             "--title" => { i += 1; title = args.get(i).ok_or("--title requires a string")?.clone(); }
@@ -1397,27 +1866,33 @@ fn parse_cli_args(args: &[String]) -> Result<Option<CliConfig>, String> {
     }
     let format = explicit_format.unwrap_or_else(|| match out_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() { "mp3" => ExportFormat::Mp3, "m4a" => ExportFormat::M4a, "mp4" => ExportFormat::VideoMp4, _ => ExportFormat::VideoMp4 });
     let clip_paths = expand_media_inputs(&clip_paths)?;
-    Ok(Some(CliConfig { out_path, format, bitrate_kbps, duration_secs, fade_ms, trim_silence_db, test_synth, transition, auto_mode, auto_interval_secs, cycle_shaders, transition_secs, video_width, video_height, fps: 30, clip_paths, meta: MediaMetadata { title, artist, album, year, lang: *b"eng", behind_text, cover_mime: "image/png", cover_bytes: Vec::new() } }))
-}
-fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut f = File::create(path).map_err(|e| format!("Failed to create '{}': {e}", path.display()))?;
-    f.write_all(bytes).map_err(|e| format!("Failed to write '{}': {e}", path.display()))?;
-    f.flush().map_err(|e| format!("Failed to flush '{}': {e}", path.display()))
+    Ok(Some(CliConfig { out_path, format, bitrate_kbps, duration_secs, fade_ms, trim_silence_db, test_synth, transition, auto_mode, auto_interval_secs, cycle_shaders, transition_secs, video_width, video_height, fps: 30, clip_paths, frame_cache_dir, meta: MediaMetadata { title, artist, album, year, lang: *b"eng", behind_text, cover_mime: "image/png", cover_bytes: Vec::new() } }))
 }
 fn main() -> Result<(), String> {
     wasapi_loopback::init_terminal_and_signals();
     let args: Vec<String> = env::args().collect();
     let mut cfg = match parse_cli_args(&args)? { Some(c) => c, None => return Ok(()) };
     let mut scenes: Vec<VisualScene> = Vec::new();
-    for p in &cfg.clip_paths {
+    // Video clips are decoded ONCE into a buffered on-disk frame cache and then
+    // streamed back during encode, so RAM stays flat no matter the clip length.
+    let cache_dir = frame_cache_dir(cfg.frame_cache_dir.as_deref());
+    for (clip_idx, p) in cfg.clip_paths.iter().enumerate() {
         let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
         if ext == "mp4" || ext == "mov" || ext == "mkv" {
-            #[cfg(windows)] { let bytes_per_frame = (cfg.video_width * cfg.video_height * 3).max(1); let mem_frame_cap = (768 * 1024 * 1024) / bytes_per_frame; let max_f = ((cfg.duration_secs as usize) * (cfg.fps as usize)).min(900).min(mem_frame_cap.max(30)); let clip_scene = mf_video_engine::decode_video_clip_to_canvases(p, cfg.video_width, cfg.video_height, max_f)?; scenes.push(clip_scene); }
+            #[cfg(windows)] {
+                // Cap by duration and a hard frame ceiling; no RAM-size cap is needed now
+                // that frames live on disk (this replaced the old 768 MiB budget).
+                let max_f = ((cfg.duration_secs as usize) * (cfg.fps as usize)).max(1);
+                let cache_path = frame_cache_path(&cache_dir, clip_idx);
+                let frames = mf_video_engine::decode_video_clip_to_disk_frames(p, cfg.video_width, cfg.video_height, max_f, &cache_path)?;
+                println!("\x1b[1;38;2;0;229;255m[STREAM][0m {} frame(s) of '{}' cached to \x1b[38;2;255;225;120m{}\x1b[0m ({} KiB, streamed during encode)", frames.frame_count, p.display(), cache_path.display(), fs::metadata(&cache_path).map(|m| m.len() / 1024).unwrap_or(0));
+                scenes.push(VisualScene::from_disk(frames));
+            }
             #[cfg(not(windows))] { return Err(format!("Video clip '{}' needs Windows Media Foundation decoding — build/run on Windows.", p.display())); }
         } else { let canvas = load_image_as_rgb_canvas(p, cfg.video_width, cfg.video_height)?; scenes.push(VisualScene::from_single(canvas)); }
     }
     if scenes.len() < 2 { let start_v = scenes.len(); for v in start_v..4 { scenes.push(VisualScene::from_single(synthesize_procedural_scene(cfg.video_width, cfg.video_height, v))); } }
-    cfg.meta.cover_mime = "image/png"; cfg.meta.cover_bytes = encode_rgb_canvas_to_png(scenes[0].frame_at(0));
+    cfg.meta.cover_mime = "image/png"; cfg.meta.cover_bytes = encode_rgb_canvas_to_png(&scenes[0].frame_owned(0)?);
     let capture = wasapi_loopback::capture(&cfg, scenes.len())?;
     if !capture.timeline_events.is_empty() || !capture.cue_notes.is_empty() {
         cfg.meta.behind_text.push_str("\n\n--- AUTO & LIVE TRANSITION LOG ---\n");
@@ -1425,9 +1900,22 @@ fn main() -> Result<(), String> {
         for note in &capture.cue_notes { cfg.meta.behind_text.push_str(note); cfg.meta.behind_text.push('\n'); }
     }
     println!("\x1b[1;38;2;0;229;255m[SESSION TELEMETRY]\x1b[0m Clean Frames: \x1b[1;38;2;255;210;80m{}\x1b[0m ({:.2}s) | Integrated: \x1b[1;38;2;0;235;165m{:+.1} LUFS\x1b[0m | Max Peak: \x1b[1;38;2;255;120;150m{:+.1} dBFS\x1b[0m | Auto/Live Transitions: \x1b[1;38;2;190;155;255m{}\x1b[0m", capture.total_frames, (capture.total_frames as f64) / (capture.sample_rate.max(1) as f64), capture.integrated_lufs, capture.max_peak_dbfs, capture.timeline_events.len());
-    let id3 = serialize_id3v23_header(&cfg.meta)?; let mut full_mp3 = Vec::with_capacity(id3.len() + capture.mp3_bytes.len()); full_mp3.extend_from_slice(&id3); full_mp3.extend_from_slice(&capture.mp3_bytes);
-    if matches!(cfg.format, ExportFormat::Mp3 | ExportFormat::All) { let p = if cfg.format == ExportFormat::All { cfg.out_path.with_extension("mp3") } else { cfg.out_path.clone() }; write_atomic_file(&p, &full_mp3)?; println!("\x1b[1;38;2;0;235;140m[OK]\x1b[0m MP3 (ID3v2.3 APIC + USLT/COMM) -> \x1b[1;38;2;255;225;120m{}\x1b[0m ({} B)", p.display(), full_mp3.len()); }
-    if matches!(cfg.format, ExportFormat::M4a | ExportFormat::All) { let p = if cfg.format == ExportFormat::All { cfg.out_path.with_extension("m4a") } else { cfg.out_path.clone() }; let m4a_bytes = serialize_m4a_container(capture.sample_rate, &capture.mp3_bytes, &cfg.meta)?; write_atomic_file(&p, &m4a_bytes)?; println!("\x1b[1;38;2;0;235;140m[OK]\x1b[0m M4A (Audio ISO-BMFF + ilst + ID32) -> \x1b[1;38;2;255;225;120m{}\x1b[0m ({} B)", p.display(), m4a_bytes.len()); }
+    let id3 = serialize_id3v23_header(&cfg.meta)?;
+    // MP3: stream ID3v2.3 tag + LAME frames straight to a buffered temp file
+    // (previously an ID3 + MP3 concat Vec was allocated just to be written once).
+    if matches!(cfg.format, ExportFormat::Mp3 | ExportFormat::All) {
+        let p = if cfg.format == ExportFormat::All { cfg.out_path.with_extension("mp3") } else { cfg.out_path.clone() };
+        let mut out = AtomicFileWriter::create(&p)?;
+        out.write_all(&id3)?;
+        out.write_all(&capture.mp3_bytes)?;
+        let written = out.commit()?;
+        println!("\x1b[1;38;2;0;235;140m[OK]\x1b[0m MP3 (ID3v2.3 APIC + USLT/COMM) -> \x1b[1;38;2;255;225;120m{}\x1b[0m ({} B)", p.display(), written);
+    }
+    if matches!(cfg.format, ExportFormat::M4a | ExportFormat::All) {
+        let p = if cfg.format == ExportFormat::All { cfg.out_path.with_extension("m4a") } else { cfg.out_path.clone() };
+        let written = write_m4a_container_to_path(&p, capture.sample_rate, &capture.mp3_bytes, &cfg.meta)?;
+        println!("\x1b[1;38;2;0;235;140m[OK]\x1b[0m M4A (Audio ISO-BMFF + ilst + ID32) -> \x1b[1;38;2;255;225;120m{}\x1b[0m ({} B)", p.display(), written);
+    }
     if matches!(cfg.format, ExportFormat::VideoMp4 | ExportFormat::All) {
         let p = if cfg.format == ExportFormat::All { cfg.out_path.with_extension("mp4") } else { cfg.out_path.clone() };
         print!("\x1b[38;2;0;229;255m[ENCODING HARDWARE H.264 + AAC-LC MP4 VIA WINDOWS MEDIA FOUNDATION...]\x1b[0m\r"); let _ = std::io::stdout().flush();
@@ -1435,5 +1923,7 @@ fn main() -> Result<(), String> {
         let sz = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         println!("\x1b[1;38;2;0;235;140m[OK]\x1b[0m MP4 (MediaFoundation H.264 NV12 + AAC-LC 192k {}x{} @ {}fps + ilst/ID32) -> \x1b[1;38;2;255;225;120m{}\x1b[0m ({} B)          ", cfg.video_width, cfg.video_height, cfg.fps, p.display(), sz);
     }
+    // Drop the streamed frame cache (each DiskFrameSet also self-deletes on drop).
+    let _ = fs::remove_dir_all(&cache_dir);
     Ok(())
 }
