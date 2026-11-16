@@ -1,0 +1,28 @@
+# Native CPU codegen — AVX2/FMA/BMI2 for the per-pixel & per-sample loops.
+# This file must live in <project>/.cargo/config.toml (or ~/.cargo/config.toml).
+# Remove the +avx512 line if your CPU predates AVX-512 (most laptops are AVX2-only).
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt",
+    "-C", "opt-level=3",
+#   "-C", "lto=fat",
+    "-C", "codegen-units=1",
+]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt",
+    "-C", "opt-level=3",
+#   "-C", "lto=fat",
+    "-C", "codegen-units=1",
+]
+
+# Linux/macOS (for the non-Windows fallback path / CI checks)
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt",
+]

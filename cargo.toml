@@ -17,4 +17,57 @@ features = [
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_Threading",
+    "Win32_System_Variant",
 ]
+
+# ============================================================
+# ULTRA-FAST RELEASE PROFILE
+# ============================================================
+# Why each line matters for encode throughput:
+#  opt-level=3 + lto="fat" + codegen-units=1 : cross-crate inlining of the
+#    per-pixel / per-sample hot loops (bilinear, NV12, quantize, FFT).
+#    This is the single biggest compile-time win (~15-30% runtime).
+#  panic="abort" : removes unwinding tables + landing pads from hot loops.
+#  strip=true    : smaller binary, better i-cache, faster startup.
+#  incremental=false : required for fat LTO to actually apply.
+#  debug=false   : no debuginfo bloat in the hot path.
+#
+# Build with:  cargo build --release
+# Do NOT use `cargo run` (debug) for encoding — it is 10-50x slower.
+
+[profile.release]
+opt-level = 3
+# lto = "fat"
+#codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+debug = false
+overflow-checks = false
+lto = "thin"
+codegen-units = 16
+
+[profile.bench]
+lto = "thin"
+codegen-units = 16
+
+
+# Thin-LTO alternative if fat LTO link time is too long on your machine:
+# [profile.release]
+# lto = "thin"
+# codegen-units = 16
+
+# ============================================================
+# OPTIONAL: faster LAME encode (also changed in code)
+# ============================================================
+# mp3lame-encoder's Quality::Best (original) is ~3-5x slower than Fastest
+# for <5% quality difference at 192k. The code now uses Quality::Fastest.
+# If you need best quality, flip it back — see encode_stereo_f32_to_mp3().
+
+# ============================================================
+# OPTIONAL: parallel physics rendering without new deps
+# ============================================================
+# The optimized main.rs uses std::thread::scope (no rayon needed) to split
+# transition rendering by rows across all cores. No Cargo change required.
+# If you want rayon for even simpler parallelism, uncomment:
+# rayon = "1.10"
