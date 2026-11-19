@@ -4,3 +4,5 @@ target/
 *.mp4
 *.mp3
 *.m4a
+# local test harness (not part of the app)
+.arena/
