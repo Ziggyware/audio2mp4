@@ -3,1209 +3,298 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WASAPI Loopback -> MP3 (ID3v2.3) & MP4 (ISO-BMFF) Binary Muxer</title>
+<title>audio2mp4 — record → MP3 + MP4, edit, save</title>
 <style>
   :root {
-    --bg: #08090c;
-    --panel: #10131a;
-    --border: #242b3d;
-    --accent: #ffb000;
-    --accent-dim: #704d00;
-    --cyan: #00e5ff;
-    --danger: #ff2a54;
-    --ok: #00e676;
-    --text: #e2e8f0;
-    --muted: #8492a6;
-    --mono: 'DM Mono', 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+    --bg: #0e1014;
+    --panel: #151920;
+    --panel-2: #1b2029;
+    --border: #2a3140;
+    --text: #dde3ec;
+    --muted: #8794a7;
+    --accent: #4c9aff;
+    --ok: #35c46b;
+    --warn: #e2a93b;
+    --err: #ef5b5b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * { box-sizing: border-box; }
   body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    padding: 20px;
-    line-height: 1.45;
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
-  .grid {
-    max-width: 1320px;
-    margin: 0 auto;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+  header h1 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  .status { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #59617a; margin-right: 6px; vertical-align: 1px; }
+  .status.rec .dot { background: var(--err); animation: pulse 1.1s ease-in-out infinite; }
+  .status.busy .dot { background: var(--warn); }
+  .status.ok .dot { background: var(--ok); }
+  @keyframes pulse { 50% { opacity: .25; } }
+  .layout { display: grid; grid-template-columns: minmax(0,1fr) 390px; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+  .row > * { min-width: 0; }
+  label.f { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); flex: 1 1 150px; }
+  input[type="text"], input[type="number"], select, textarea {
+    width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 5px; padding: 7px 9px; font: inherit; font-size: 13px;
   }
-  @media (max-width: 960px) {
-    .grid { grid-template-columns: 1fr; }
-  }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .header-bar {
-    grid-column: 1 / -1;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 12px;
-    margin-bottom: 4px;
-  }
-  .title {
-    font-family: var(--mono);
-    font-size: 1.02rem;
-    font-weight: 700;
-    color: var(--accent);
-    letter-spacing: 0.5px;
-  }
-  .badge {
-    font-family: var(--mono);
-    font-size: 0.75rem;
-    padding: 4px 8px;
-    border-radius: 3px;
-    background: #161b26;
-    border: 1px solid var(--border);
-    color: var(--accent);
-  }
-  .section-label {
-    font-family: var(--mono);
-    font-size: 0.76rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--accent);
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 6px;
-  }
-  .row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-  }
-  .row-3 {
-    display: grid;
-    grid-template-columns: 1.3fr 0.8fr 0.9fr;
-    gap: 10px;
-  }
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 0.78rem;
-    color: var(--muted);
-    font-family: var(--mono);
-  }
-  input[type="text"], select, textarea {
-    background: #0a0c10;
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 8px 10px;
-    border-radius: 3px;
-    font-family: var(--mono);
-    font-size: 0.83rem;
-  }
-  input[type="text"]:focus, select:focus, textarea:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-  textarea {
-    resize: vertical;
-    min-height: 150px;
-  }
-  .controls {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    align-items: center;
-  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 68px; }
   button {
-    font-family: var(--mono);
-    font-size: 0.8rem;
-    font-weight: 600;
-    padding: 9px 14px;
-    border-radius: 3px;
-    border: 1px solid var(--border);
-    background: #171c28;
-    color: var(--text);
-    cursor: pointer;
-    transition: border-color 0.15s, background 0.15s;
+    font: inherit; font-size: 13px; font-weight: 550; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px 13px; cursor: pointer; white-space: nowrap;
   }
-  button:hover:not(:disabled) {
-    border-color: var(--accent);
-    background: #1f2637;
-  }
-  button:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-  button.primary {
-    background: #2b1f00;
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  button.cyan {
-    background: #002b36;
-    border-color: var(--cyan);
-    color: var(--cyan);
-  }
-  button.danger {
-    background: #3b0d18;
-    border-color: var(--danger);
-    color: #ff8da1;
-  }
-  canvas {
-    width: 100%;
-    height: 110px;
-    background: #060709;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-  }
-  .cover-drop {
-    display: grid;
-    grid-template-columns: 120px 1fr;
-    gap: 12px;
-    align-items: center;
-    background: #0a0c10;
-    border: 1px dashed var(--border);
-    border-radius: 3px;
-    padding: 10px;
-  }
-  .cover-preview {
-    width: 120px;
-    height: 120px;
-    object-fit: cover;
-    background: #060709;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    display: block;
-  }
-  .telemetry {
-    font-family: var(--mono);
-    font-size: 0.75rem;
-    background: #07080b;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    padding: 10px;
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-  }
-  .metric-val {
-    color: var(--ok);
-    font-weight: 700;
-    font-size: 0.86rem;
-  }
-  .hex-view {
-    font-family: var(--mono);
-    font-size: 0.72rem;
-    background: #060709;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    padding: 10px;
-    height: 165px;
-    overflow-y: auto;
-    white-space: pre;
-    color: #ffd166;
-  }
-  .output-box {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 10px;
-    background: #0c0f16;
-    border: 1px solid var(--accent-dim);
-    border-radius: 3px;
-  }
-  audio {
-    width: 100%;
-    height: 36px;
-  }
+  button:hover:not(:disabled) { border-color: #3d4759; background: #232a36; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #07101f; }
+  button.primary:hover:not(:disabled) { background: #66aaff; border-color: #66aaff; }
+  button.danger { color: #ffb3b3; border-color: #5a2a2a; }
+  button.danger:hover:not(:disabled) { background: #341a1a; border-color: #7a3535; }
+  button.small { padding: 5px 9px; font-size: 12px; }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .err { color: var(--err); font-size: 12.5px; }
+  .ok { color: var(--ok); }
+
+  /* video / preview */
+  .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+  .stage canvas#view { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: contain; background: #000; }
+  .stage video#preview { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; }
+  .transport { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .transport input[type="range"] { flex: 1; accent-color: var(--accent); }
+  .timecode { font-family: var(--mono); font-size: 12.5px; color: var(--muted); min-width: 108px; text-align: right; }
+
+  /* waveform */
+  canvas#wave { display: block; width: 100%; height: 74px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; cursor: crosshair; }
+  .sel-info { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+  /* timeline */
+  .tl { margin-top: 2px; }
+  .track { position: relative; height: 34px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; margin-top: 6px; overflow: hidden; cursor: pointer; }
+  .track .clip { position: absolute; top: 3px; bottom: 3px; background: #2c3d5c; border-radius: 3px; min-width: 2px; }
+  .track .clip.video { background: #334a63; }
+  .track .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warn); pointer-events: none; }
+  .track .playhead::before { content: ""; position: absolute; top: 0; left: -3px; border: 4px solid transparent; border-top-color: var(--warn); }
+  .track-label { font-size: 11px; color: var(--muted); width: 46px; float: left; line-height: 34px; height: 34px; }
+  .track-wrap { display: grid; grid-template-columns: 48px 1fr; align-items: center; gap: 6px; }
+
+  /* file list */
+  .files { display: flex; flex-direction: column; gap: 6px; }
+  .file-item { display: flex; align-items: center; gap: 9px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; }
+  .file-item .meta { flex: 1; min-width: 0; }
+  .file-item .name { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-item .info { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+  .file-item.active { border-color: var(--accent); }
+  .tag { font-size: 10.5px; font-family: var(--mono); border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; color: var(--muted); }
+  .tag.edited { color: var(--warn); border-color: #5c4a22; }
+
+  /* cover */
+  .cover-row { display: grid; grid-template-columns: 84px 1fr; gap: 12px; align-items: start; }
+  #coverImg { width: 84px; height: 84px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); background: var(--panel-2); }
+
+  /* progress */
+  .progress { display: none; flex-direction: column; gap: 6px; margin-top: 10px; }
+  .progress.show { display: flex; }
+  .progress .bar { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+  .progress .bar > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .12s linear; }
+  .progress .lbl { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .log { font-family: var(--mono); font-size: 11.5px; color: var(--muted); max-height: 110px; overflow: auto; white-space: pre-wrap; margin-top: 10px; }
+  .log:empty { display: none; }
+  a.dl { display: inline-block; }
 </style>
 </head>
 <body>
-<div class="grid">
-  <div class="header-bar">
-    <div class="title">WIN_AUDIO_MUX // WASAPI LOOPBACK -> MP3 (ID3v2.3) & MP4 (ISO-BMFF / ilst)</div>
-    <div class="badge" id="stateBadge">STATE: IDLE</div>
-  </div>
+<div class="wrap">
+  <header>
+    <h1>audio2mp4</h1>
+    <span class="sub">record system audio → MP3 + MP4 · open, trim, retag, save</span>
+    <span class="status" id="status"><span class="dot"></span><span id="statusText">idle</span></span>
+  </header>
 
-  <!-- Left Column: Audio Capture + Telemetry + Output -->
-  <div class="card">
-    <div class="section-label">1. Hardware Loopback, Bitrate & Target Container</div>
-    <div class="row-3">
-      <label>
-        Capture Source
-        <select id="sourceMode">
-          <option value="loopback">Windows System Audio (WASAPI)</option>
-          <option value="mic">Microphone / Line-In</option>
-          <option value="synth">Test Harmonic (440Hz + 659Hz)</option>
-        </select>
-      </label>
-      <label>
-        Bitrate (CBR)
-        <select id="bitrateSelect">
-          <option value="128">128 kbps</option>
-          <option value="192" selected>192 kbps</option>
-          <option value="256">256 kbps</option>
-          <option value="320">320 kbps</option>
-        </select>
-      </label>
-      <label>
-        Output Container
-        <select id="containerSelect">
-          <option value="both" selected>Both (.MP3 + .MP4)</option>
-          <option value="mp3">MP3 Only (ID3v2.3)</option>
-          <option value="mp4">MP4 Only (ISO-BMFF)</option>
-        </select>
-      </label>
-    </div>
-
-    <div class="controls">
-      <button id="btnStart" class="primary">START CAPTURE</button>
-      <button id="btnStop" class="danger" disabled>STOP & SYNTHESIZE</button>
-      <button id="btnReMux" disabled>RE-MUX METADATA ONLY</button>
-    </div>
-
-    <canvas id="scopeCanvas" width="580" height="110"></canvas>
-
-    <div class="telemetry">
-      <div>SAMPLE RATE: <div class="metric-val" id="metricSr">0 Hz</div></div>
-      <div>PCM FRAMES: <div class="metric-val" id="metricFrames">0</div></div>
-      <div>DURATION: <div class="metric-val" id="metricDur">00:00.0</div></div>
-      <div>MP3 ARTIFACT: <div class="metric-val" id="metricMp3Bytes">0 B</div></div>
-      <div>MP4 ARTIFACT: <div class="metric-val" id="metricMp4Bytes">0 B</div></div>
-      <div>PEAK dBFS: <div class="metric-val" id="metricPeak">-Inf dB</div></div>
-    </div>
-
-    <div class="section-label">2. Synthesized Artifacts (.MP3 & .MP4 Download + Playback)</div>
-    <div class="output-box" id="outputBox" style="display:none;">
-      <audio id="audioPlayer" controls></audio>
-      <div class="controls">
-        <a id="downloadMp3Link" style="text-decoration:none;display:none;">
-          <button class="primary" type="button">DOWNLOAD .MP3 (ID3v2.3)</button>
-        </a>
-        <a id="downloadMp4Link" style="text-decoration:none;display:none;">
-          <button class="cyan" type="button">DOWNLOAD .MP4 (ISO-BMFF)</button>
-        </a>
-      </div>
-      <div id="artifactSummary" style="font-family:var(--mono);font-size:0.75rem;color:var(--ok);"></div>
-    </div>
-
-    <div class="section-label">Binary Container Verification (ID3v2.3 Frames & ISO-14496-12 MP4 Box Tree)</div>
-    <div class="hex-view" id="hexInspector">Awaiting synthesis... Select "Both (.MP3 + .MP4)", ".MP3", or ".MP4".</div>
-  </div>
-
-  <!-- Right Column: Cover Image (APIC / covr) & Backing Text (USLT / ©lyr) -->
-  <div class="card">
-    <div class="section-label">3. Cover Image Payload (ID3v2.3 APIC + MP4 moov.udta.meta.ilst.covr)</div>
-    <div class="cover-drop">
-      <img id="coverPreview" class="cover-preview" alt="Cover Art Preview" />
-      <div style="display:flex;flex-direction:column;gap:8px;">
-        <input type="file" id="imageInput" accept="image/jpeg,image/png,image/webp" style="font-family:var(--mono);font-size:0.78rem;color:var(--muted);" />
-        <div style="display:flex;gap:8px;">
-          <button type="button" id="btnGenCover">GENERATE PROCEDURAL COVER</button>
+  <div class="layout">
+    <!-- ======================= LEFT: record / edit / preview ======================= -->
+    <div>
+      <!-- Record -->
+      <section class="card" id="recordCard">
+        <h2>1 · Record</h2>
+        <div class="row">
+          <label class="f">Audio source
+            <select id="source">
+              <option value="system" selected>System audio (share a tab / screen with audio)</option>
+              <option value="mic">Microphone / line-in</option>
+              <option value="tone">Test tone</option>
+            </select>
+          </label>
+          <label class="f">MP3 bitrate
+            <select id="bitrate">
+              <option value="128">128 kbps</option>
+              <option value="192" selected>192 kbps</option>
+              <option value="256">256 kbps</option>
+              <option value="320">320 kbps</option>
+            </select>
+          </label>
         </div>
-        <div id="imageMeta" style="font-family:var(--mono);font-size:0.75rem;color:var(--muted);">Procedural cover initialized</div>
-      </div>
+        <div class="btn-row">
+          <button class="primary" id="btnRecord">● Record</button>
+          <button class="danger" id="btnStop" disabled>■ Stop</button>
+          <span class="timecode" id="recTime" style="min-width:auto;align-self:center;">0:00.0</span>
+        </div>
+        <div class="hint" id="recHint">System capture asks which tab/window to share — tick “Share tab audio” (or “Share system audio” on Windows) in the picker.</div>
+        <div class="progress" id="recProgress"><div class="bar"><i></i></div><div class="lbl"></div></div>
+      </section>
+
+      <!-- Player -->
+      <section class="card" id="playerCard">
+        <h2>2 · Preview</h2>
+        <div class="stage" id="stage">
+          <canvas id="view" width="640" height="360"></canvas>
+          <video id="preview" style="display:none" playsinline></video>
+        </div>
+        <div class="transport">
+          <button class="small" id="btnPlay">▶ Play</button>
+          <span class="timecode" id="tc">0:00.0 / 0:00.0</span>
+          <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+        </div>
+        <div class="btn-row">
+          <button class="small" id="btnFrameBack" title="Back one frame (←)">◀ frame</button>
+          <button class="small" id="btnFrameFwd" title="Forward one frame (→)">frame ▶</button>
+          <label class="f" style="flex:0 0 118px; flex-direction:row; align-items:center; gap:6px;">FPS
+            <input type="number" id="fpsNum" min="10" max="60" step="1" value="24" style="width:64px">
+          </label>
+          <label class="f" style="flex:0 0 auto; flex-direction:row; align-items:center; gap:6px;">
+            <input type="checkbox" id="chkMute" style="width:auto"> Mute
+          </label>
+        </div>
+      </section>
+
+      <!-- Trim -->
+      <section class="card" id="trimCard">
+        <h2>3 · Trim (applies to audio and video together)</h2>
+        <canvas id="wave" height="74"></canvas>
+        <div class="sel-info" id="selInfo">No file loaded.</div>
+        <div class="btn-row">
+          <button class="small" id="btnSelStart" title="Set selection start at the playhead">Set start ⇤</button>
+          <button class="small" id="btnSelEnd" title="Set selection end at the playhead">Set end ⇥</button>
+          <button class="small" id="btnSelClear">Clear selection</button>
+          <button class="small" id="btnSelToClip">Selection = whole file</button>
+        </div>
+      </section>
+
+      <!-- Timeline -->
+      <section class="card" id="timelineCard">
+        <h2>4 · Tracks</h2>
+        <div class="tl">
+          <div class="track-wrap">
+            <span class="track-label">Video</span>
+            <div class="track" id="trackVideo"><div class="clip video" id="clipVideo"></div><div class="playhead" id="phVideo"></div></div>
+          </div>
+          <div class="track-wrap">
+            <span class="track-label">Audio</span>
+            <div class="track" id="trackAudio"><div class="clip" id="clipAudio"></div><div class="playhead" id="phAudio"></div></div>
+          </div>
+        </div>
+        <div class="hint">Click a track to move the playhead. Playhead follows playback in real time.</div>
+      </section>
+
+      <!-- Edit + Save -->
+      <section class="card" id="editCard">
+        <h2>5 · Edit &amp; save</h2>
+        <div class="row">
+          <label class="f">Start (s)
+            <input type="number" id="inSec" min="0" step="0.05" value="0">
+          </label>
+          <label class="f">End (s)
+            <input type="number" id="outSec" min="0" step="0.05" value="0">
+          </label>
+          <label class="f">Save as
+            <select id="saveFormat">
+              <option value="mp4">MP4 (video + audio)</option>
+              <option value="mp3">MP3 (audio only)</option>
+              <option value="m4a">M4A (audio only)</option>
+            </select>
+          </label>
+          <label class="f" style="flex:1 1 190px;">Bitrate
+            <select id="saveBitrate">
+              <option value="128000">128 kbps</option>
+              <option value="192000" selected>192 kbps</option>
+              <option value="256000">256 kbps</option>
+              <option value="320000">320 kbps</option>
+            </select>
+          </label>
+        </div>
+        <div class="btn-row">
+          <button class="primary" id="btnSave">Save (fast, no re-encode)</button>
+          <button id="btnExport">Export with edits (re-encode)</button>
+          <button class="small" id="btnReset">Reset edits</button>
+        </div>
+        <div class="progress" id="saveProgress"><div class="bar"><i></i></div><div class="lbl"></div></div>
+        <div class="hint">Save = lossless remux of the current file with updated tags/cover. Export = cut to the Start–End range and re-encode.</div>
+        <div class="log" id="editLog"></div>
+      </section>
     </div>
 
-    <div class="section-label">4. Text Behind Audio (ID3v2.3 USLT/COMM + MP4 ilst ©lyr/©cmt + ID32)</div>
-    <div class="row">
-      <label>
-        Track Title (TIT2 / ©nam)
-        <input type="text" id="inputTitle" value="Windows Loopback Capture" />
-      </label>
-      <label>
-        Artist / Endpoint (TPE1 / ©ART)
-        <input type="text" id="inputArtist" value="WASAPI Render Endpoint" />
-      </label>
+    <!-- ======================= RIGHT: files / metadata ======================= -->
+    <div>
+      <section class="card">
+        <h2>Files</h2>
+        <div class="btn-row" style="margin:0 0 10px">
+          <button class="small" id="btnOpen">Open file…</button>
+          <button class="small" id="btnSaveAs">Save as…</button>
+        </div>
+        <input type="file" id="fileInput" accept=".mp3,.mp4,.m4a,audio/*,video/*" multiple hidden>
+        <div class="files" id="fileList"></div>
+        <div class="hint" id="fileHint">Nothing loaded. Record something, or open an MP3 / MP4 / M4A.</div>
+        <div class="log" id="loadLog"></div>
+      </section>
+
+      <section class="card">
+        <h2>Tags</h2>
+        <div class="row">
+          <label class="f">Title <input type="text" id="mTitle" placeholder="Untitled"></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label class="f">Artist <input type="text" id="mArtist" placeholder="Artist"></label>
+          <label class="f">Album <input type="text" id="mAlbum" placeholder="Album"></label>
+        </div>
+        <label class="f" style="margin-top:8px">Comment / lyrics
+          <textarea id="mComment" placeholder="Embedded comment or lyrics"></textarea>
+        </label>
+        <div class="row" style="margin-top:8px">
+          <label class="f">Year <input type="text" id="mYear" placeholder="2026" style="width:100%"></label>
+          <label class="f" style="flex:0 0 auto">
+            <span>Cover</span>
+            <input type="file" id="coverInput" accept="image/*" style="font-size:12px">
+          </label>
+        </div>
+        <div class="cover-row" style="margin-top:8px">
+          <canvas id="coverCv" width="84" height="84"></canvas>
+          <div>
+            <div class="hint" id="coverInfo" style="margin:0">No cover. Pick one, or the frame at the playhead is used by default.</div>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="small" id="btnUseFrame">Use current frame</button>
+          <button class="small" id="btnClearCover">Clear cover</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Info</h2>
+        <div class="sel-info" id="fileInfo">—</div>
+        <div class="log" id="saveLog"></div>
+      </section>
     </div>
-    <div class="row">
-      <label>
-        Album / Session (TALB / ©alb)
-        <input type="text" id="inputAlbum" value="System Audio Archive" />
-      </label>
-      <label>
-        Language Code (ISO-639-2)
-        <input type="text" id="inputLang" value="eng" maxlength="3" />
-      </label>
-    </div>
-    <label>
-      Embedded Text / Transcript / Lyrics Behind Audio (Embedded in both MP3 & MP4)
-      <textarea id="inputBehindText">Captured via deterministic WASAPI loopback pipeline.
-Embedded simultaneously inside:
-- MP3: ID3v2.3 USLT (Unsynchronized Lyrics) + COMM frames in UTF-16LE with BOM.
-- MP4: ISO/IEC 14496-12 moov.udta.meta.ilst (©lyr + ©cmt + covr) + ID32 box.</textarea>
-    </label>
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
-<script>
-"use strict";
-
-/**
- * MODULE 1: ID3v2.3.0 BINARY SERIALIZER
- */
-const ID3v23Engine = (() => {
-  function encodeSynchsafe28(value) {
-    const v = value >>> 0;
-    return new Uint8Array([
-      (v >>> 21) & 0x7F,
-      (v >>> 14) & 0x7F,
-      (v >>> 7)  & 0x7F,
-      v & 0x7F
-    ]);
-  }
-
-  function decodeSynchsafe28(b0, b1, b2, b3) {
-    return ((b0 & 0x7F) << 21) | ((b1 & 0x7F) << 14) | ((b2 & 0x7F) << 7) | (b3 & 0x7F);
-  }
-
-  function writeU32BE(buf, offset, val) {
-    const v = val >>> 0;
-    buf[offset]     = (v >>> 24) & 0xFF;
-    buf[offset + 1] = (v >>> 16) & 0xFF;
-    buf[offset + 2] = (v >>> 8)  & 0xFF;
-    buf[offset + 3] = v & 0xFF;
-  }
-
-  function readU32BE(buf, offset) {
-    return (((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0);
-  }
-
-  function encodeAscii(str) {
-    const out = new Uint8Array(str.length);
-    for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0x7F;
-    return out;
-  }
-
-  function encodeUTF16LEWithBOM(str) {
-    const out = new Uint8Array(2 + str.length * 2);
-    out[0] = 0xFF;
-    out[1] = 0xFE;
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      const pos = 2 + (i << 1);
-      out[pos]     = code & 0xFF;
-      out[pos + 1] = (code >>> 8) & 0xFF;
-    }
-    return out;
-  }
-
-  function buildTextFrame(frameId, text) {
-    const strBytes = encodeUTF16LEWithBOM(text || "");
-    const payloadLen = 1 + strBytes.byteLength;
-    const frame = new Uint8Array(10 + payloadLen);
-    frame.set(encodeAscii(frameId), 0);
-    writeU32BE(frame, 4, payloadLen);
-    frame[10] = 0x01;
-    frame.set(strBytes, 11);
-    return frame;
-  }
-
-  function buildUSLTOrCOMMFrame(frameId, lang3, descriptor, text) {
-    const cleanLang = (lang3 || "eng").padEnd(3, "eng").slice(0, 3).toLowerCase();
-    const langBytes = encodeAscii(cleanLang);
-    const descBytes = encodeUTF16LEWithBOM(descriptor || "");
-    const textBytes = encodeUTF16LEWithBOM(text || "");
-    const payloadLen = 1 + 3 + descBytes.byteLength + 2 + textBytes.byteLength;
-    const frame = new Uint8Array(10 + payloadLen);
-    frame.set(encodeAscii(frameId), 0);
-    writeU32BE(frame, 4, payloadLen);
-    let p = 10;
-    frame[p++] = 0x01;
-    frame.set(langBytes, p); p += 3;
-    frame.set(descBytes, p); p += descBytes.byteLength;
-    frame[p++] = 0x00;
-    frame[p++] = 0x00;
-    frame.set(textBytes, p);
-    return frame;
-  }
-
-  function buildAPICFrame(mimeType, imageBytes) {
-    const mimeBytes = encodeAscii(mimeType || "image/png");
-    const descBytes = encodeAscii("Cover (front)");
-    const payloadLen = 1 + mimeBytes.byteLength + 1 + 1 + descBytes.byteLength + 1 + imageBytes.byteLength;
-    const frame = new Uint8Array(10 + payloadLen);
-    frame.set(encodeAscii("APIC"), 0);
-    writeU32BE(frame, 4, payloadLen);
-    let p = 10;
-    frame[p++] = 0x00;
-    frame.set(mimeBytes, p); p += mimeBytes.byteLength;
-    frame[p++] = 0x00;
-    frame[p++] = 0x03;
-    frame.set(descBytes, p); p += descBytes.byteLength;
-    frame[p++] = 0x00;
-    frame.set(imageBytes, p);
-    return frame;
-  }
-
-  function serializeID3v23(meta) {
-    const frames = [];
-    if (meta.title)  frames.push(buildTextFrame("TIT2", meta.title));
-    if (meta.artist) frames.push(buildTextFrame("TPE1", meta.artist));
-    if (meta.album)  frames.push(buildTextFrame("TALB", meta.album));
-    if (meta.behindText) {
-      frames.push(buildUSLTOrCOMMFrame("USLT", meta.lang, "Transcript", meta.behindText));
-      frames.push(buildUSLTOrCOMMFrame("COMM", meta.lang, "ID3v2.3 Text", meta.behindText));
-    }
-    if (meta.imageBytes && meta.imageBytes.byteLength > 0) {
-      frames.push(buildAPICFrame(meta.imageMime || "image/png", meta.imageBytes));
-    }
-    let bodyLength = 0;
-    for (let i = 0; i < frames.length; i++) bodyLength += frames[i].byteLength;
-
-    const out = new Uint8Array(10 + bodyLength);
-    out.set([0x49, 0x44, 0x33, 0x03, 0x00, 0x00], 0);
-    out.set(encodeSynchsafe28(bodyLength), 6);
-    let offset = 10;
-    for (let i = 0; i < frames.length; i++) {
-      out.set(frames[i], offset);
-      offset += frames[i].byteLength;
-    }
-    return out;
-  }
-
-  return { serializeID3v23, decodeSynchsafe28, readU32BE, writeU32BE, encodeAscii };
-})();
-
-/**
- * MODULE 2: ISO/IEC 14496-12 (.MP4) CONTAINER MUXER (ZERO-DEPENDENCY)
- * Packages MPEG-1 Layer III frames into an ISO Base Media File Format container with:
- * - mp4a sample entry + esds (ObjectTypeIndication = 0x6B)
- * - Exact per-frame stsz / stts / stsc / stco sample tables
- * - Apple ilst metadata atoms (©nam, ©ART, ©alb, ©lyr, ©cmt, covr) + ID32 box
- */
-const MP4IsoEngine = (() => {
-  const BITRATES_V1_L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
-  const BITRATES_V2_L3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
-  const SR_V1 = [44100, 48000, 32000, 0];
-  const SR_V2 = [22050, 24000, 16000, 0];
-  const SR_V25 = [11025, 12000, 8000, 0];
-
-  function parseMp3Frames(rawMp3) {
-    const sizes = [];
-    const chunks = [];
-    let totalCleanBytes = 0;
-    let detectedSpf = 1152;
-    let offset = 0;
-    const n = rawMp3.byteLength;
-
-    while (offset + 4 <= n) {
-      const b0 = rawMp3[offset];
-      const b1 = rawMp3[offset + 1];
-      if (b0 !== 0xFF || (b1 & 0xE0) !== 0xE0) {
-        offset++;
-        continue;
-      }
-      const verId = (b1 >>> 3) & 0x03;
-      const layerId = (b1 >>> 1) & 0x03;
-      if (verId === 1 || layerId !== 1) {
-        offset++;
-        continue;
-      }
-      const b2 = rawMp3[offset + 2];
-      const brIdx = (b2 >>> 4) & 0x0F;
-      const srIdx = (b2 >>> 2) & 0x03;
-      const padding = (b2 >>> 1) & 0x01;
-      if (brIdx === 0 || brIdx === 15 || srIdx === 3) {
-        offset++;
-        continue;
-      }
-      let bitrate = 0, sr = 0, spf = 1152, coeff = 144;
-      if (verId === 3) {
-        bitrate = BITRATES_V1_L3[brIdx];
-        sr = SR_V1[srIdx];
-        spf = 1152;
-        coeff = 144;
-      } else if (verId === 2) {
-        bitrate = BITRATES_V2_L3[brIdx];
-        sr = SR_V2[srIdx];
-        spf = 576;
-        coeff = 72;
-      } else {
-        bitrate = BITRATES_V2_L3[brIdx];
-        sr = SR_V25[srIdx];
-        spf = 576;
-        coeff = 72;
-      }
-      if (!sr || !bitrate) {
-        offset++;
-        continue;
-      }
-      const frameLen = Math.floor((coeff * bitrate * 1000) / sr) + padding;
-      if (frameLen < 24 || offset + frameLen > n) break;
-
-      detectedSpf = spf;
-      chunks.push(rawMp3.subarray(offset, offset + frameLen));
-      sizes.push(frameLen);
-      totalCleanBytes += frameLen;
-      offset += frameLen;
-    }
-
-    if (sizes.length === 0 && rawMp3.byteLength > 0) {
-      return { cleanMp3: rawMp3, frameSizes: [rawMp3.byteLength], samplesPerFrame: 1152 };
-    }
-
-    const cleanMp3 = new Uint8Array(totalCleanBytes);
-    let pos = 0;
-    for (let i = 0; i < chunks.length; i++) {
-      cleanMp3.set(chunks[i], pos);
-      pos += chunks[i].byteLength;
-    }
-    return { cleanMp3, frameSizes: sizes, samplesPerFrame: detectedSpf };
-  }
-
-  function concatArrays(arrays) {
-    let total = 0;
-    for (let i = 0; i < arrays.length; i++) total += arrays[i].byteLength;
-    const out = new Uint8Array(total);
-    let pos = 0;
-    for (let i = 0; i < arrays.length; i++) {
-      out.set(arrays[i], pos);
-      pos += arrays[i].byteLength;
-    }
-    return out;
-  }
-
-  function mp4Box(typeStr, payload) {
-    const out = new Uint8Array(8 + payload.byteLength);
-    ID3v23Engine.writeU32BE(out, 0, out.byteLength);
-    for (let i = 0; i < 4; i++) out[4 + i] = typeStr.charCodeAt(i) & 0xFF;
-    out.set(payload, 8);
-    return out;
-  }
-
-  function mp4FullBox(typeStr, version, flags, payload) {
-    const out = new Uint8Array(12 + payload.byteLength);
-    ID3v23Engine.writeU32BE(out, 0, out.byteLength);
-    for (let i = 0; i < 4; i++) out[4 + i] = typeStr.charCodeAt(i) & 0xFF;
-    out[8] = version & 0xFF;
-    out[9] = (flags >>> 16) & 0xFF;
-    out[10] = (flags >>> 8) & 0xFF;
-    out[11] = flags & 0xFF;
-    out.set(payload, 12);
-    return out;
-  }
-
-  function u32Bytes(v) {
-    const b = new Uint8Array(4);
-    ID3v23Engine.writeU32BE(b, 0, v >>> 0);
-    return b;
-  }
-
-  function u16Bytes(v) {
-    return new Uint8Array([(v >>> 8) & 0xFF, v & 0xFF]);
-  }
-
-  function buildItunesTextAtom(fourccStr, text) {
-    const utf8 = new TextEncoder().encode(text || "");
-    const dataPayload = concatArrays([u32Bytes(1), u32Bytes(0), utf8]);
-    return mp4Box(fourccStr, mp4Box("data", dataPayload));
-  }
-
-  function buildItunesCovrAtom(mime, imageBytes) {
-    const typeCode = (mime && (mime.includes("jpeg") || mime.includes("jpg"))) ? 13 : 14;
-    const dataPayload = concatArrays([u32Bytes(typeCode), u32Bytes(0), imageBytes]);
-    return mp4Box("covr", mp4Box("data", dataPayload));
-  }
-
-  function buildMoov(sampleRate, frameSizes, samplesPerFrame, chunkOffset, meta, id3Bytes) {
-    const totalSamples = frameSizes.length * samplesPerFrame;
-    const unityMatrix = concatArrays([
-      u32Bytes(0x00010000), u32Bytes(0), u32Bytes(0),
-      u32Bytes(0), u32Bytes(0x00010000), u32Bytes(0),
-      u32Bytes(0), u32Bytes(0), u32Bytes(0x40000000)
-    ]);
-
-    const mvhd = mp4FullBox("mvhd", 0, 0, concatArrays([
-      u32Bytes(0), u32Bytes(0),
-      u32Bytes(sampleRate), u32Bytes(totalSamples),
-      u32Bytes(0x00010000), u16Bytes(0x0100),
-      new Uint8Array(10),
-      unityMatrix,
-      new Uint8Array(24),
-      u32Bytes(2)
-    ]));
-
-    const tkhd = mp4FullBox("tkhd", 0, 0x000007, concatArrays([
-      u32Bytes(0), u32Bytes(0),
-      u32Bytes(1), u32Bytes(0),
-      u32Bytes(totalSamples),
-      new Uint8Array(8),
-      u16Bytes(0), u16Bytes(0),
-      u16Bytes(0x0100), u16Bytes(0),
-      unityMatrix,
-      u32Bytes(0), u32Bytes(0)
-    ]));
-
-    const mdhd = mp4FullBox("mdhd", 0, 0, concatArrays([
-      u32Bytes(0), u32Bytes(0),
-      u32Bytes(sampleRate), u32Bytes(totalSamples),
-      u16Bytes(0x15C7), u16Bytes(0)
-    ]));
-
-    const hdlr = mp4FullBox("hdlr", 0, 0, concatArrays([
-      u32Bytes(0),
-      ID3v23Engine.encodeAscii("soun"),
-      new Uint8Array(12),
-      ID3v23Engine.encodeAscii("SoundHandler\0")
-    ]));
-
-    const smhd = mp4FullBox("smhd", 0, 0, new Uint8Array(4));
-    const urlBox = mp4FullBox("url ", 0, 0x000001, new Uint8Array(0));
-    const dref = mp4FullBox("dref", 0, 0, concatArrays([u32Bytes(1), urlBox]));
-    const dinf = mp4Box("dinf", dref);
-
-    const objType = sampleRate >= 32000 ? 0x6B : 0x69;
-    const esds = mp4FullBox("esds", 0, 0, new Uint8Array([
-      0x03, 0x17, 0x00, 0x01, 0x00,
-      0x04, 0x0F, objType, 0x15, 0x00, 0x18, 0x00, 0x00, 0x04, 0xE2, 0x00, 0x00, 0x02, 0xEE, 0x00,
-      0x06, 0x01, 0x02
-    ]));
-
-    const mp4a = mp4Box("mp4a", concatArrays([
-      new Uint8Array(6),
-      u16Bytes(1),
-      new Uint8Array(8),
-      u16Bytes(2),
-      u16Bytes(16),
-      u16Bytes(0),
-      u16Bytes(0),
-      u32Bytes((Math.min(65535, sampleRate) << 16) >>> 0),
-      esds
-    ]));
-
-    const stsd = mp4FullBox("stsd", 0, 0, concatArrays([u32Bytes(1), mp4a]));
-    const stts = mp4FullBox("stts", 0, 0, concatArrays([
-      u32Bytes(1), u32Bytes(frameSizes.length), u32Bytes(samplesPerFrame)
-    ]));
-    const stsc = mp4FullBox("stsc", 0, 0, concatArrays([
-      u32Bytes(1), u32Bytes(1), u32Bytes(frameSizes.length), u32Bytes(1)
-    ]));
-
-    const stszPayload = new Uint8Array(8 + frameSizes.length * 4);
-    ID3v23Engine.writeU32BE(stszPayload, 0, 0);
-    ID3v23Engine.writeU32BE(stszPayload, 4, frameSizes.length);
-    for (let i = 0; i < frameSizes.length; i++) {
-      ID3v23Engine.writeU32BE(stszPayload, 8 + i * 4, frameSizes[i]);
-    }
-    const stsz = mp4FullBox("stsz", 0, 0, stszPayload);
-    const stco = mp4FullBox("stco", 0, 0, concatArrays([u32Bytes(1), u32Bytes(chunkOffset)]));
-
-    const stbl = mp4Box("stbl", concatArrays([stsd, stts, stsc, stsz, stco]));
-    const minf = mp4Box("minf", concatArrays([smhd, dinf, stbl]));
-    const mdia = mp4Box("mdia", concatArrays([mdhd, hdlr, minf]));
-    const trak = mp4Box("trak", concatArrays([tkhd, mdia]));
-
-    // Metadata atoms (udta.meta.ilst + ID32)
-    const metaHdlr = mp4FullBox("hdlr", 0, 0, concatArrays([
-      u32Bytes(0),
-      ID3v23Engine.encodeAscii("mdirappl"),
-      new Uint8Array(9)
-    ]));
-
-    const ilstItems = [];
-    if (meta.title)  ilstItems.push(buildItunesTextAtom("\xA9nam", meta.title));
-    if (meta.artist) ilstItems.push(buildItunesTextAtom("\xA9ART", meta.artist));
-    if (meta.album)  ilstItems.push(buildItunesTextAtom("\xA9alb", meta.album));
-    if (meta.behindText) {
-      ilstItems.push(buildItunesTextAtom("\xA9lyr", meta.behindText));
-      ilstItems.push(buildItunesTextAtom("\xA9cmt", meta.behindText));
-    }
-    if (meta.imageBytes && meta.imageBytes.byteLength > 0) {
-      ilstItems.push(buildItunesCovrAtom(meta.imageMime, meta.imageBytes));
-    }
-    const ilst = mp4Box("ilst", concatArrays(ilstItems));
-    const id32 = mp4FullBox("ID32", 0, 0, concatArrays([u16Bytes(0x15C7), id3Bytes]));
-    const metaBox = mp4FullBox("meta", 0, 0, concatArrays([metaHdlr, ilst, id32]));
-    const udta = mp4Box("udta", metaBox);
-
-    return mp4Box("moov", concatArrays([mvhd, trak, udta]));
-  }
-
-  function serializeMP4(sampleRate, rawMp3Bytes, meta, id3Bytes) {
-    const { cleanMp3, frameSizes, samplesPerFrame } = parseMp3Frames(rawMp3Bytes);
-    const ftyp = mp4Box("ftyp", concatArrays([
-      ID3v23Engine.encodeAscii("mp42"),
-      u32Bytes(0),
-      ID3v23Engine.encodeAscii("mp42isomM4A ")
-    ]));
-
-    const dummyMoov = buildMoov(sampleRate, frameSizes, samplesPerFrame, 0, meta, id3Bytes);
-    const exactChunkOffset = ftyp.byteLength + dummyMoov.byteLength + 8;
-    const moov = buildMoov(sampleRate, frameSizes, samplesPerFrame, exactChunkOffset, meta, id3Bytes);
-    const mdat = mp4Box("mdat", cleanMp3);
-
-    return {
-      mp4Buffer: concatArrays([ftyp, moov, mdat]),
-      frameCount: frameSizes.length,
-      samplesPerFrame,
-      chunkOffset: exactChunkOffset,
-      moovSize: moov.byteLength,
-      mdatSize: mdat.byteLength
-    };
-  }
-
-  return { serializeMP4 };
-})();
-
-/**
- * MODULE 3: BRANCHLESS DENORMAL FLUSH + TPDF DITHERING + LAME MP3 ENCODER
- */
-class DeterministicMp3Encoder {
-  constructor(sampleRate, kbps) {
-    this.sampleRate = sampleRate;
-    this.kbps = kbps;
-    this.encoder = new lamejs.Mp3Encoder(2, sampleRate, kbps);
-    this.mp3Chunks = [];
-    this.totalMp3Bytes = 0;
-    this.prngState = 0x9E3779B9;
-    this.leftI16 = new Int16Array(1152);
-    this.rightI16 = new Int16Array(1152);
-  }
-
-  nextUniformMinusHalfToHalf() {
-    let x = this.prngState | 0;
-    x ^= x << 13;
-    x ^= x >>> 17;
-    x ^= x << 5;
-    this.prngState = x;
-    return (x >>> 0) / 4294967296.0 - 0.5;
-  }
-
-  encodeStereoSlab(leftF32, rightF32) {
-    const n = leftF32.length;
-    if (this.leftI16.length < n) {
-      this.leftI16 = new Int16Array(n);
-      this.rightI16 = new Int16Array(n);
-    }
-    const lOut = this.leftI16.subarray(0, n);
-    const rOut = this.rightI16.subarray(0, n);
-
-    for (let i = 0; i < n; i++) {
-      let sl = leftF32[i];
-      let sr = rightF32[i];
-      if (sl > -1e-20 && sl < 1e-20) sl = 0.0;
-      if (sr > -1e-20 && sr < 1e-20) sr = 0.0;
-      if (sl > 1.0) sl = 1.0; else if (sl < -1.0) sl = -1.0;
-      if (sr > 1.0) sr = 1.0; else if (sr < -1.0) sr = -1.0;
-
-      const ditherL = this.nextUniformMinusHalfToHalf() + this.nextUniformMinusHalfToHalf();
-      const ditherR = this.nextUniformMinusHalfToHalf() + this.nextUniformMinusHalfToHalf();
-
-      let ql = Math.round(sl * 32767.0 + ditherL);
-      let qr = Math.round(sr * 32767.0 + ditherR);
-      if (ql > 32767) ql = 32767; else if (ql < -32768) ql = -32768;
-      if (qr > 32767) qr = 32767; else if (qr < -32768) qr = -32768;
-
-      lOut[i] = ql;
-      rOut[i] = qr;
-    }
-
-    const mp3buf = this.encoder.encodeBuffer(lOut, rOut);
-    if (mp3buf.length > 0) {
-      const copy = new Uint8Array(mp3buf.buffer, mp3buf.byteOffset, mp3buf.byteLength).slice();
-      this.mp3Chunks.push(copy);
-      this.totalMp3Bytes += copy.byteLength;
-    }
-  }
-
-  finalize() {
-    const tail = this.encoder.flush();
-    if (tail.length > 0) {
-      const copy = new Uint8Array(tail.buffer, tail.byteOffset, tail.byteLength).slice();
-      this.mp3Chunks.push(copy);
-      this.totalMp3Bytes += copy.byteLength;
-    }
-    const flatMp3 = new Uint8Array(this.totalMp3Bytes);
-    let offset = 0;
-    for (let i = 0; i < this.mp3Chunks.length; i++) {
-      flatMp3.set(this.mp3Chunks[i], offset);
-      offset += this.mp3Chunks[i].byteLength;
-    }
-    return flatMp3;
-  }
-}
-
-const WORKLET_SOURCE = `
-class LoopbackSlabProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.capacity = 4096;
-    this.leftSlab = new Float32Array(this.capacity);
-    this.rightSlab = new Float32Array(this.capacity);
-    this.writeIndex = 0;
-  }
-  process(inputs) {
-    const input = inputs[0];
-    if (!input || input.length === 0) return true;
-    const ch0 = input[0];
-    const ch1 = input.length > 1 ? input[1] : ch0;
-    const frames = ch0.length;
-    let peak = 0.0;
-
-    for (let i = 0; i < frames; i++) {
-      const l = ch0[i];
-      const r = ch1[i];
-      const al = l < 0 ? -l : l;
-      const ar = r < 0 ? -r : r;
-      if (al > peak) peak = al;
-      if (ar > peak) peak = ar;
-
-      this.leftSlab[this.writeIndex] = l;
-      this.rightSlab[this.writeIndex] = r;
-      this.writeIndex++;
-
-      if (this.writeIndex === this.capacity) {
-        const lCopy = this.leftSlab.slice();
-        const rCopy = this.rightSlab.slice();
-        this.port.postMessage({ left: lCopy, right: rCopy, peak }, [lCopy.buffer, rCopy.buffer]);
-        this.writeIndex = 0;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('loopback-slab-processor', LoopbackSlabProcessor);
-`;
-
-(() => {
-  const ui = {
-    stateBadge: document.getElementById("stateBadge"),
-    sourceMode: document.getElementById("sourceMode"),
-    bitrateSelect: document.getElementById("bitrateSelect"),
-    containerSelect: document.getElementById("containerSelect"),
-    btnStart: document.getElementById("btnStart"),
-    btnStop: document.getElementById("btnStop"),
-    btnReMux: document.getElementById("btnReMux"),
-    scopeCanvas: document.getElementById("scopeCanvas"),
-    metricSr: document.getElementById("metricSr"),
-    metricFrames: document.getElementById("metricFrames"),
-    metricDur: document.getElementById("metricDur"),
-    metricMp3Bytes: document.getElementById("metricMp3Bytes"),
-    metricMp4Bytes: document.getElementById("metricMp4Bytes"),
-    metricPeak: document.getElementById("metricPeak"),
-    outputBox: document.getElementById("outputBox"),
-    audioPlayer: document.getElementById("audioPlayer"),
-    downloadMp3Link: document.getElementById("downloadMp3Link"),
-    downloadMp4Link: document.getElementById("downloadMp4Link"),
-    artifactSummary: document.getElementById("artifactSummary"),
-    hexInspector: document.getElementById("hexInspector"),
-    coverPreview: document.getElementById("coverPreview"),
-    imageInput: document.getElementById("imageInput"),
-    btnGenCover: document.getElementById("btnGenCover"),
-    imageMeta: document.getElementById("imageMeta"),
-    inputTitle: document.getElementById("inputTitle"),
-    inputArtist: document.getElementById("inputArtist"),
-    inputAlbum: document.getElementById("inputAlbum"),
-    inputLang: document.getElementById("inputLang"),
-    inputBehindText: document.getElementById("inputBehindText")
-  };
-
-  const scopeCtx = ui.scopeCanvas.getContext("2d");
-
-  let audioCtx = null;
-  let mediaStream = null;
-  let workletNode = null;
-  let synthOsc1 = null;
-  let synthOsc2 = null;
-  let synthGain = null;
-  let mp3Encoder = null;
-
-  let capturedFrames = 0;
-  let sampleRate = 48000;
-  let lastRawMp3Bytes = null;
-  let coverImageBytes = null;
-  let coverImageMime = "image/png";
-  let currentMp3Url = null;
-  let currentMp4Url = null;
-
-  function formatBytes(b) {
-    if (b < 1024) return `${b} B`;
-    if (b < 1048576) return `${(b / 1024).toFixed(1)} KiB`;
-    return `${(b / 1048576).toFixed(2)} MiB`;
-  }
-
-  function formatDuration(sec) {
-    const m = Math.floor(sec / 60).toString().padStart(2, "0");
-    const s = (sec % 60).toFixed(1).padStart(4, "0");
-    return `${m}:${s}`;
-  }
-
-  function generateProceduralCover() {
-    const c = document.createElement("canvas");
-    c.width = 600;
-    c.height = 600;
-    const ctx = c.getContext("2d");
-
-    const grad = ctx.createLinearGradient(0, 0, 600, 600);
-    grad.addColorStop(0, "#090b10");
-    grad.addColorStop(0.5, "#1f1605");
-    grad.addColorStop(1, "#06080c");
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, 600, 600);
-
-    ctx.strokeStyle = "rgba(255, 176, 0, 0.25)";
-    ctx.lineWidth = 1.5;
-    const seed = (Date.now() & 0xFFFF);
-    for (let r = 30; r < 290; r += 16) {
-      ctx.beginPath();
-      for (let a = 0; a <= Math.PI * 2.05; a += 0.05) {
-        const mod = Math.sin(a * 6 + (seed % 7)) * 8 + Math.cos(a * 11) * 4;
-        const x = 300 + (r + mod) * Math.cos(a);
-        const y = 300 + (r + mod) * Math.sin(a);
-        if (a === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.closePath();
-      ctx.stroke();
-    }
-
-    ctx.fillStyle = "#ffb000";
-    ctx.font = "bold 26px Consolas, monospace";
-    ctx.fillText((ui.inputTitle.value || "WASAPI CAPTURE").slice(0, 24).toUpperCase(), 40, 520);
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = "18px Consolas, monospace";
-    ctx.fillText((ui.inputArtist.value || "SYSTEM LOOPBACK").slice(0, 30), 40, 552);
-
-    c.toBlob(async (blob) => {
-      if (!blob) return;
-      const ab = await blob.arrayBuffer();
-      coverImageBytes = new Uint8Array(ab);
-      coverImageMime = "image/png";
-      ui.coverPreview.src = URL.createObjectURL(blob);
-      ui.imageMeta.textContent = `Procedural PNG | 600x600 | ${formatBytes(coverImageBytes.byteLength)}`;
-    }, "image/png");
-  }
-
-  ui.imageInput.addEventListener("change", async (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (!file) return;
-    const ab = await file.arrayBuffer();
-    coverImageBytes = new Uint8Array(ab);
-    coverImageMime = file.type || "image/jpeg";
-    ui.coverPreview.src = URL.createObjectURL(file);
-    ui.imageMeta.textContent = `${file.name} | ${coverImageMime} | ${formatBytes(coverImageBytes.byteLength)}`;
-  });
-
-  ui.btnGenCover.addEventListener("click", generateProceduralCover);
-
-  function drawOscilloscope(leftF32, rightF32) {
-    const w = ui.scopeCanvas.width;
-    const h = ui.scopeCanvas.height;
-    scopeCtx.fillStyle = "#060709";
-    scopeCtx.fillRect(0, 0, w, h);
-
-    scopeCtx.strokeStyle = "#1c2230";
-    scopeCtx.beginPath();
-    scopeCtx.moveTo(0, h / 2);
-    scopeCtx.lineTo(w, h / 2);
-    scopeCtx.stroke();
-
-    scopeCtx.strokeStyle = "#ffb000";
-    scopeCtx.lineWidth = 1.5;
-    scopeCtx.beginPath();
-    const step = Math.max(1, Math.floor(leftF32.length / w));
-    for (let x = 0; x < w; x++) {
-      const idx = Math.min(leftF32.length - 1, x * step);
-      const sample = (leftF32[idx] + rightF32[idx]) * 0.5;
-      const y = (0.5 - sample * 0.45) * h;
-      if (x === 0) scopeCtx.moveTo(x, y);
-      else scopeCtx.lineTo(x, y);
-    }
-    scopeCtx.stroke();
-  }
-
-  async function acquireAudioSource(mode, ctx) {
-    if (mode === "synth") {
-      synthOsc1 = ctx.createOscillator();
-      synthOsc2 = ctx.createOscillator();
-      synthGain = ctx.createGain();
-      synthOsc1.type = "sine";
-      synthOsc1.frequency.value = 440;
-      synthOsc2.type = "triangle";
-      synthOsc2.frequency.value = 659.25;
-      synthGain.gain.value = 0.25;
-      synthOsc1.connect(synthGain);
-      synthOsc2.connect(synthGain);
-      synthOsc1.start();
-      synthOsc2.start();
-      return synthGain;
-    }
-
-    if (mode === "mic") {
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
-        video: false
-      });
-      return ctx.createMediaStreamSource(mediaStream);
-    }
-
-    mediaStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
-      systemAudio: "include"
-    });
-
-    if (mediaStream.getAudioTracks().length === 0) {
-      mediaStream.getTracks().forEach(t => t.stop());
-      throw new Error("No Windows audio track captured. Ensure 'Share system audio' is toggled ON in the picker.");
-    }
-    mediaStream.getVideoTracks().forEach(vt => vt.stop());
-    return ctx.createMediaStreamSource(mediaStream);
-  }
-
-  function muxAndPublishArtifacts(rawMp3Bytes) {
-    const meta = {
-      title: ui.inputTitle.value.trim(),
-      artist: ui.inputArtist.value.trim(),
-      album: ui.inputAlbum.value.trim(),
-      lang: ui.inputLang.value.trim(),
-      behindText: ui.inputBehindText.value,
-      imageBytes: coverImageBytes,
-      imageMime: coverImageMime
-    };
-
-    const containerMode = ui.containerSelect.value;
-    const baseName = (meta.title || "windows_audio").replace(/[^a-zA-Z0-9_\-.]/g, "_");
-    const id3Tag = ID3v23Engine.serializeID3v23(meta);
-
-    // 1. Build MP3 Artifact
-    const mp3Full = new Uint8Array(id3Tag.byteLength + rawMp3Bytes.byteLength);
-    mp3Full.set(id3Tag, 0);
-    mp3Full.set(rawMp3Bytes, id3Tag.byteLength);
-
-    // 2. Build ISO-BMFF MP4 Artifact
-    const mp4Result = MP4IsoEngine.serializeMP4(sampleRate, rawMp3Bytes, meta, id3Tag);
-    const mp4Full = mp4Result.mp4Buffer;
-
-    ui.metricMp3Bytes.textContent = formatBytes(mp3Full.byteLength);
-    ui.metricMp4Bytes.textContent = formatBytes(mp4Full.byteLength);
-
-    if (currentMp3Url) URL.revokeObjectURL(currentMp3Url);
-    if (currentMp4Url) URL.revokeObjectURL(currentMp4Url);
-
-    currentMp3Url = URL.createObjectURL(new Blob([mp3Full], { type: "audio/mpeg" }));
-    currentMp4Url = URL.createObjectURL(new Blob([mp4Full], { type: "video/mp4" }));
-
-    ui.downloadMp3Link.href = currentMp3Url;
-    ui.downloadMp3Link.download = `${baseName}.mp3`;
-    ui.downloadMp4Link.href = currentMp4Url;
-    ui.downloadMp4Link.download = `${baseName}.mp4`;
-
-    ui.downloadMp3Link.style.display = (containerMode === "mp3" || containerMode === "both") ? "inline-block" : "none";
-    ui.downloadMp4Link.style.display = (containerMode === "mp4" || containerMode === "both") ? "inline-block" : "none";
-
-    ui.audioPlayer.src = (containerMode === "mp4") ? currentMp4Url : currentMp3Url;
-    ui.artifactSummary.textContent =
-      `MP3: ${formatBytes(mp3Full.byteLength)} (ID3v2.3: ${formatBytes(id3Tag.byteLength)}) | ` +
-      `MP4: ${formatBytes(mp4Full.byteLength)} (moov: ${formatBytes(mp4Result.moovSize)}, mdat: ${formatBytes(mp4Result.mdatSize)}, frames: ${mp4Result.frameCount})`;
-
-    const report = [
-      `=== CONTAINER 1: ${baseName}.mp3 (ID3v2.3 + MPEG-1 Layer III) ===`,
-      `  ID3v2.3 Header Size : ${id3Tag.byteLength} B (TIT2, TPE1, TALB, USLT, COMM, APIC)`,
-      `  MPEG-1 L3 Payload   : ${rawMp3Bytes.byteLength} B`,
-      ``,
-      `=== CONTAINER 2: ${baseName}.mp4 (ISO/IEC 14496-12 / QuickTime ilst + ID32) ===`,
-      `  [ftyp] brand=mp42/isom/M4A  @ +0x000000 (28 B)`,
-      `  [moov] Movie Box            @ +0x00001C (${mp4Result.moovSize} B)`,
-      `    +-- [mvhd] timescale=${sampleRate} Hz, duration=${mp4Result.frameCount * mp4Result.samplesPerFrame}`,
-      `    +-- [trak.mdia.minf.stbl]`,
-      `          +-- [stsd -> mp4a -> esds] ObjectTypeIndication=0x6B (ISO/IEC 11172-3 Audio)`,
-      `          +-- [stts] ${mp4Result.frameCount} frames x ${mp4Result.samplesPerFrame} samples/frame`,
-      `          +-- [stsz] ${mp4Result.frameCount} exact per-frame byte lengths`,
-      `          +-- [stco] chunk_offset = 0x${mp4Result.chunkOffset.toString(16).toUpperCase()} (${mp4Result.chunkOffset})`,
-      `    +-- [udta.meta.ilst] ©nam, ©ART, ©alb, ©lyr (Lyrics/Text), ©cmt, covr (Cover Image)`,
-      `    +-- [udta.meta.ID32] Full embedded ID3v2.3 tag (${id3Tag.byteLength} B)`,
-      `  [mdat] Media Data Box       @ +0x${(mp4Result.chunkOffset - 8).toString(16).toUpperCase()} (${mp4Result.mdatSize} B)`
-    ];
-    ui.hexInspector.textContent = report.join("\n");
-    ui.outputBox.style.display = "flex";
-    ui.btnReMux.disabled = false;
-  }
-
-  ui.btnStart.addEventListener("click", async () => {
-    try {
-      ui.stateBadge.textContent = "STATE: INITIALIZING WASAPI...";
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-      sampleRate = audioCtx.sampleRate;
-      ui.metricSr.textContent = `${sampleRate} Hz`;
-
-      const workletBlob = new Blob([WORKLET_SOURCE], { type: "application/javascript" });
-      const workletUrl = URL.createObjectURL(workletBlob);
-      await audioCtx.audioWorklet.addModule(workletUrl);
-      URL.revokeObjectURL(workletUrl);
-
-      const sourceNode = await acquireAudioSource(ui.sourceMode.value, audioCtx);
-      const kbps = parseInt(ui.bitrateSelect.value, 10) || 192;
-      mp3Encoder = new DeterministicMp3Encoder(sampleRate, kbps);
-      capturedFrames = 0;
-
-      workletNode = new AudioWorkletNode(audioCtx, "loopback-slab-processor");
-      workletNode.port.onmessage = (ev) => {
-        const { left, right, peak } = ev.data;
-        capturedFrames += left.length;
-        mp3Encoder.encodeStereoSlab(left, right);
-
-        drawOscilloscope(left, right);
-        ui.metricFrames.textContent = capturedFrames.toLocaleString();
-        ui.metricDur.textContent = formatDuration(capturedFrames / sampleRate);
-        ui.metricMp3Bytes.textContent = formatBytes(mp3Encoder.totalMp3Bytes);
-        const db = peak > 1e-9 ? (20 * Math.log10(peak)).toFixed(1) : "-Inf";
-        ui.metricPeak.textContent = `${db} dB`;
-      };
-
-      sourceNode.connect(workletNode);
-      ui.btnStart.disabled = true;
-      ui.btnStop.disabled = false;
-      ui.sourceMode.disabled = true;
-      ui.bitrateSelect.disabled = true;
-      ui.stateBadge.textContent = "STATE: RECORDING & ENCODING";
-    } catch (err) {
-      ui.stateBadge.textContent = "STATE: FAULT";
-      ui.hexInspector.textContent = `CAPTURE ERROR: ${err && err.message ? err.message : String(err)}`;
-      if (audioCtx) {
-        audioCtx.close();
-        audioCtx = null;
-      }
-    }
-  });
-
-  ui.btnStop.addEventListener("click", async () => {
-    if (workletNode) { workletNode.disconnect(); workletNode = null; }
-    if (synthOsc1) { synthOsc1.stop(); synthOsc1 = null; }
-    if (synthOsc2) { synthOsc2.stop(); synthOsc2 = null; }
-    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-    if (audioCtx) { await audioCtx.close(); audioCtx = null; }
-
-    if (mp3Encoder) {
-      lastRawMp3Bytes = mp3Encoder.finalize();
-      muxAndPublishArtifacts(lastRawMp3Bytes);
-    }
-
-    ui.btnStart.disabled = false;
-    ui.btnStop.disabled = true;
-    ui.sourceMode.disabled = false;
-    ui.bitrateSelect.disabled = false;
-    ui.stateBadge.textContent = "STATE: ARTIFACTS READY";
-  });
-
-  ui.btnReMux.addEventListener("click", () => {
-    if (!lastRawMp3Bytes) return;
-    muxAndPublishArtifacts(lastRawMp3Bytes);
-    ui.stateBadge.textContent = "STATE: RE-MUXED (.MP3 & .MP4)";
-  });
-
-  ui.containerSelect.addEventListener("change", () => {
-    if (lastRawMp3Bytes) muxAndPublishArtifacts(lastRawMp3Bytes);
-  });
-
-  generateProceduralCover();
-})();
-</script>
+<script src="vendor/lamejs.min.js"></script>
+<script src="vendor/mediabunny.min.js"></script>
+<script src="app.js"></script>
 </body>
 </html>
