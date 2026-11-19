@@ -941,7 +941,7 @@ pub fn render_physics_transition_frame(scene_a: &RgbCanvas, scene_b: &RgbCanvas,
 #[cfg(windows)]
 mod mf_video_engine {
     use super::*;
-    use windows::core::{Interface, HSTRING};
+    use windows::core::{HSTRING};
     use windows::Win32::Media::MediaFoundation::*;
     use windows::Win32::System::Com::*;
 
@@ -1259,7 +1259,7 @@ mod mf_video_engine {
                     let _ = media_buf.Unlock();
                     return Err("Media Foundation returned a null NV12 buffer pointer".to_string());
                 }
-                let mut dst_slice = std::slice::from_raw_parts_mut(dst_ptr, nv12_byte_len);
+                let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, nv12_byte_len);
                 if active_trans.is_some() {
                     rgb24_to_nv12(&transition_canvas, &mut dst_slice[..]);
                 } else if let Some((sc_idx, local)) = hold_static {
